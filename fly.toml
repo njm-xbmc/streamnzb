@@ -30,7 +30,3 @@ port = 1119
 memory = "512mb"
 cpu_kind = "shared"
 cpus = 1
-
-[mounts]
-source = "streamnzb_data"
-destination = "/app/data"
