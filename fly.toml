@@ -1,5 +1,4 @@
-[app]
-name = "my-streamnzb"
+app = "streamnzb"
 primary_region = "lhr"
 
 [build]
@@ -7,12 +6,6 @@ image = "ghcr.io/gaisberg/streamnzb:latest"
 
 [env]
 TZ = "Europe/London"
-
-# Uncomment and set these to pre-configure on first run:
-# SECURITY_TOKEN = "changeme"
-# NZBHYDRA2_URL = ""         # leave blank, using Prowlarr instead
-# PROWLARR_URL = "https://my-prowlarr.fly.dev"
-# PROWLARR_API_KEY = ""      # fill in after Prowlarr is running
 
 [[services]]
 internal_port = 7000
