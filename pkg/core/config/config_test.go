@@ -1,12 +1,15 @@
 package config
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	coreenv "streamnzb/pkg/core/env"
 )
 
 func TestMergeIndexerSearchDefaultsSeriesSeasonAndCompleteSearchOn(t *testing.T) {
@@ -182,6 +185,51 @@ func TestIndexerConfigEffectiveTimeoutHonorsExplicitOverride(t *testing.T) {
 	}
 }
 
+func TestValidateIndexerProxyURL(t *testing.T) {
+	if err := ValidateIndexerProxyURL(""); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateIndexerProxyURL("http://proxy:8888"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateIndexerProxyURL("socks5://127.0.0.1:1080"); err == nil {
+		t.Fatal("expected error for socks5 scheme")
+	}
+	if err := ValidateIndexerProxyURL("http://"); err == nil {
+		t.Fatal("expected error for missing host")
+	}
+}
+
+func TestValidateIndexerProxyReachable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	if err := ValidateIndexerProxyReachable("http://" + ln.Addr().String()); err != nil {
+		t.Fatalf("expected reachable proxy, got err: %v", err)
+	}
+}
+
+func TestRedactProxyURLForAPI(t *testing.T) {
+	got := RedactProxyURLForAPI("http://user:secret@proxy:8888")
+	want := "http://proxy:8888"
+	if got != want {
+		t.Fatalf("RedactProxyURLForAPI = %q, want %q", got, want)
+	}
+}
+
 func TestMigrateLegacyIndexersBackfillsEasynewsTimeout(t *testing.T) {
 	cfg := &Config{
 		Indexers: []IndexerConfig{
@@ -246,6 +294,67 @@ func TestConfigEffectivePlaybackStartupTimeoutRejectsOutOfRangeValues(t *testing
 	}
 }
 
+func TestConfigEffectiveFailoverFastModeDefaultsEnabled(t *testing.T) {
+	var cfg *Config
+	if !cfg.EffectiveFailoverFastMode() {
+		t.Fatalf("EffectiveFailoverFastMode() = false, want true")
+	}
+}
+
+func TestConfigEffectiveFailoverFastModeHonorsEnabledValue(t *testing.T) {
+	cfg := &Config{FailoverFastMode: true}
+	if !cfg.EffectiveFailoverFastMode() {
+		t.Fatalf("EffectiveFailoverFastMode() = false, want true")
+	}
+}
+
+func TestConfigEffectiveFailoverFastModeHonorsDisabledValue(t *testing.T) {
+	cfg := &Config{FailoverFastMode: false}
+	if cfg.EffectiveFailoverFastMode() {
+		t.Fatalf("EffectiveFailoverFastMode() = true, want false")
+	}
+}
+
+func TestApplyEnvOverridesForcesAdminPasswordResetPrompt(t *testing.T) {
+	t.Setenv(coreenv.AdminForcePasswordResetEnv, "true")
+	o, keys := coreenv.ReadConfigOverrides()
+	cfg := &Config{}
+
+	ApplyEnvOverrides(cfg, o, keys)
+
+	if !cfg.AdminMustChangePassword {
+		t.Fatalf("AdminMustChangePassword = false, want true")
+	}
+}
+
+func TestConfigEffectiveAvailNZBFilterReportedBadDefaultsDisabled(t *testing.T) {
+	cfg := &Config{}
+	if cfg.EffectiveAvailNZBFilterReportedBad() {
+		t.Fatalf("EffectiveAvailNZBFilterReportedBad() = true, want false")
+	}
+}
+
+func TestConfigEffectiveAvailNZBFilterReportedBadHonorsExplicitValue(t *testing.T) {
+	cfg := &Config{AvailNZBFilterReportedBad: ptrBool(true)}
+	if !cfg.EffectiveAvailNZBFilterReportedBad() {
+		t.Fatalf("EffectiveAvailNZBFilterReportedBad() = false, want true")
+	}
+	cfg = &Config{AvailNZBFilterReportedBad: ptrBool(false)}
+	if cfg.EffectiveAvailNZBFilterReportedBad() {
+		t.Fatalf("EffectiveAvailNZBFilterReportedBad() = true, want false")
+	}
+}
+
+func TestConfigEffectiveAvailNZBFilterReportedBadDisabledWhenAvailNZBModeOff(t *testing.T) {
+	cfg := &Config{
+		AvailNZBMode:              "off",
+		AvailNZBFilterReportedBad: ptrBool(true),
+	}
+	if cfg.EffectiveAvailNZBFilterReportedBad() {
+		t.Fatalf("EffectiveAvailNZBFilterReportedBad() = true, want false when mode is off")
+	}
+}
+
 func TestApplyStreamModelUpgradeDefaultsCreatesQueriesAndDefaultStream(t *testing.T) {
 	cfg := &Config{
 		Providers: []Provider{
@@ -303,6 +412,12 @@ func TestApplyStreamModelUpgradeDefaultsCreatesQueriesAndDefaultStream(t *testin
 	}
 	if stream.EnableFailover == nil || !*stream.EnableFailover {
 		t.Fatalf("expected default stream failover enabled, got %#v", stream.EnableFailover)
+	}
+	if stream.AutoAddProviders == nil || !*stream.AutoAddProviders {
+		t.Fatalf("expected default stream auto add providers enabled, got %#v", stream.AutoAddProviders)
+	}
+	if stream.AutoAddIndexers == nil || !*stream.AutoAddIndexers {
+		t.Fatalf("expected default stream auto add indexers enabled, got %#v", stream.AutoAddIndexers)
 	}
 	if len(stream.ProviderSelections) != 2 || stream.ProviderSelections[0] != "newshosting" {
 		t.Fatalf("unexpected provider selections: %#v", stream.ProviderSelections)

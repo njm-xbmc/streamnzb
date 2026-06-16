@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -44,11 +45,14 @@ type Server struct {
 	tmdbAPIKey     string
 	tvdbAPIKey     string
 
-	clients       map[*Client]bool
-	clientsMu     sync.Mutex
-	logCh         chan string
-	attemptLister *persistence.StateManager
-	availNZBStore availnzb.KeyStore
+	clients         map[*Client]bool
+	clientsMu       sync.Mutex
+	logCh           chan string
+	attemptLister   *persistence.StateManager
+	availNZBStore   availnzb.KeyStore
+	metricsMu       sync.Mutex
+	lastMetricsAt   time.Time
+	metricsInFlight bool
 }
 
 type Client struct {
@@ -214,6 +218,10 @@ func (s *Server) ReloadFromComponents(comp *app.Components, fullReload bool) {
 	}
 
 	s.config = comp.Config
+	if s.sessionMgr != nil {
+		s.sessionMgr.SetTTL(time.Duration(comp.Config.EffectiveSessionTTLSeconds()) * time.Second)
+		s.sessionMgr.SetPostPlaybackEvictTTL(time.Duration(comp.Config.EffectiveSessionPostPlaybackTTLSeconds()) * time.Second)
+	}
 	s.tmdbAPIKey = strings.TrimSpace(comp.Config.TMDBAPIKey)
 	s.tvdbAPIKey = strings.TrimSpace(comp.Config.TVDBAPIKey)
 	if s.app != nil {
@@ -360,6 +368,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/streams/", authMiddleware(http.HandlerFunc(s.handleManagedStreams)))
 	mux.Handle("/api/indexer/caps", authMiddleware(http.HandlerFunc(s.handleGetIndexerCaps)))
 	mux.Handle("/api/indexer/caps/refresh", authMiddleware(http.HandlerFunc(s.handleRefreshIndexerCaps)))
+	mux.Handle("/api/stats/persisted", authMiddleware(http.HandlerFunc(s.handlePersistedStats)))
+	mux.Handle("/api/stats/history", authMiddleware(http.HandlerFunc(s.handleStatsHistory)))
 	mux.Handle("/api/availnzb/status", authMiddleware(http.HandlerFunc(s.handleAvailNZBStatus)))
 	mux.Handle("/api/sessions/close", authMiddleware(http.HandlerFunc(s.handleCloseSession)))
 	mux.Handle("/api/restart", authMiddleware(http.HandlerFunc(s.handleRestart)))
@@ -368,6 +378,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/tmdb/tv/", authMiddleware(http.HandlerFunc(s.handleTMDBTV)))
 	mux.Handle("/api/search/streams", authMiddleware(http.HandlerFunc(s.handleStreams)))
 	mux.Handle("/api/search/releases", authMiddleware(http.HandlerFunc(s.handleSearchReleases)))
+	mux.Handle("/api/play/nzb", authMiddleware(http.HandlerFunc(s.handleDirectPlayNZB)))
 
 	mux.Handle("/api/logs/download", authMiddleware(http.HandlerFunc(s.handleDownloadLogs)))
 	mux.Handle("/api/nzb-attempts", authMiddleware(http.HandlerFunc(s.handleNZBAttempts)))

@@ -14,6 +14,27 @@ import (
 	"streamnzb/pkg/services/availnzb"
 )
 
+type namedIndexer interface {
+	Name() string
+}
+
+func indexerNameFromRelease(rel *release.Release) string {
+	if rel == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(rel.Indexer); name != "" {
+		return name
+	}
+	if rel.SourceIndexer != nil {
+		if n, ok := rel.SourceIndexer.(namedIndexer); ok {
+			if name := strings.TrimSpace(n.Name()); name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
 type playlistResult struct {
 	Candidates       []triage.Candidate
 	FirstIsAvailGood bool
@@ -310,6 +331,9 @@ func buildAllReleasesFromRaw(raw *rawSearchResult) []*release.Release {
 		if rel == nil {
 			continue
 		}
+		if release.IsFullDiscRelease(rel.Title) {
+			continue
+		}
 		out = append(out, rel)
 	}
 	return out
@@ -332,7 +356,7 @@ func buildPlaylistSource(raw *rawSearchResult, filteringActive bool) *playlistSo
 		Releases:               buildAllReleasesFromRaw(raw),
 		Avail:                  raw.Avail,
 		CachedAvailable:        cachedAvailable,
-		UnavailableDetailsURLs: buildUnavailableDetailsURLs(raw.Avail, filteringActive),
+		UnavailableDetailsURLs: buildUnavailableDetailsURLs(raw.Avail),
 	}
 }
 
@@ -350,10 +374,56 @@ func releasesToCandidates(releases []*release.Release) []triage.Candidate {
 func (s *Server) buildPlaylistFromRaw(raw *rawSearchResult, isAIOStreams bool, stream *auth.Stream) (*playlistResult, error) {
 	filterMode, filteringActive := resolveFilterMode(stream)
 	source := buildPlaylistSource(raw, filteringActive)
-	candidates := buildPlaylistCandidates(source)
-	candidates = s.applyPlaylistFiltering(candidates, source, isAIOStreams, filteringActive, filterMode, stream)
+	inputCandidates := buildPlaylistCandidates(source)
+	candidates := s.applyPlaylistFiltering(inputCandidates, source, isAIOStreams, filteringActive, filterMode, stream)
 	candidates = applyPlaylistSorting(candidates, s.triageService, filteringActive, filterMode, stream)
+	s.recordAvailIndexerStats(inputCandidates, candidates, source, filteringActive)
 	return buildPlaylistResult(source, candidates), nil
+}
+
+func (s *Server) shouldFilterAvailNZBReportedBad() bool {
+	if s == nil || s.config == nil {
+		return true
+	}
+	return s.config.EffectiveAvailNZBFilterReportedBad()
+}
+
+func (s *Server) recordAvailIndexerStats(inputCandidates, finalCandidates []triage.Candidate, source *playlistSource, filteringActive bool) {
+	if source == nil {
+		return
+	}
+	availableByIndexer := make(map[string]int)
+	discardedByIndexer := make(map[string]int)
+
+	if s.shouldFilterAvailNZBReportedBad() && len(source.UnavailableDetailsURLs) > 0 {
+		for _, c := range inputCandidates {
+			if c.Release == nil || c.Release.DetailsURL == "" {
+				continue
+			}
+			if !source.UnavailableDetailsURLs[c.Release.DetailsURL] {
+				continue
+			}
+			if name := indexerNameFromRelease(c.Release); name != "" {
+				discardedByIndexer[name]++
+			}
+		}
+	}
+
+	if len(source.CachedAvailable) > 0 {
+		for _, c := range finalCandidates {
+			if c.Release == nil || c.Release.DetailsURL == "" {
+				continue
+			}
+			if !source.CachedAvailable[c.Release.DetailsURL] {
+				continue
+			}
+			if name := indexerNameFromRelease(c.Release); name != "" {
+				availableByIndexer[name]++
+			}
+		}
+	}
+
+	s.addAvailIndexerStats(availableByIndexer, discardedByIndexer)
 }
 
 func resolveFilterMode(stream *auth.Stream) (string, bool) {
@@ -632,9 +702,9 @@ func (s *Server) markCachedReleaseUnavailable(key StreamSlotKey, detailsURL, slo
 	}
 }
 
-func buildUnavailableDetailsURLs(availCtx *AvailContext, filteringActive bool) map[string]bool {
+func buildUnavailableDetailsURLs(availCtx *AvailContext) map[string]bool {
 	out := make(map[string]bool)
-	if !filteringActive || availCtx == nil {
+	if availCtx == nil {
 		return out
 	}
 	for detailsURL := range availCtx.UnavailableByDetailsURL {
@@ -644,14 +714,17 @@ func buildUnavailableDetailsURLs(availCtx *AvailContext, filteringActive bool) m
 }
 
 func filterCandidates(merged []triage.Candidate, isAIOStreams, filteringActive bool, unavailableDetailsURLs map[string]bool) []triage.Candidate {
-	if !filteringActive {
+	if len(unavailableDetailsURLs) == 0 && !filteringActive {
 		return merged
 	}
 	var seenTitle map[string]bool
 	if isAIOStreams {
 		seenTitle = make(map[string]bool)
 	}
-	filtered := merged[:0]
+	// Build a new slice instead of compacting in-place, so callers that keep a
+	// reference to the original candidate list (for metrics accounting) are not
+	// accidentally mutated by filtering.
+	filtered := make([]triage.Candidate, 0, len(merged))
 	for _, c := range merged {
 		if c.Release == nil {
 			continue
@@ -681,11 +754,23 @@ func buildPlaylistCandidates(source *playlistSource) []triage.Candidate {
 }
 
 func (s *Server) applyPlaylistFiltering(candidates []triage.Candidate, source *playlistSource, isAIOStreams, filteringActive bool, filterMode string, stream *auth.Stream) []triage.Candidate {
+	availReportedBadFilteringEnabled := s.shouldFilterAvailNZBReportedBad()
+	unavailableDetailsURLs := map[string]bool{}
+	if availReportedBadFilteringEnabled {
+		// Remove releases explicitly known as unavailable by AvailNZB when enabled.
+		unavailableDetailsURLs = source.UnavailableDetailsURLs
+	}
+	availFilteredOut := countCandidatesByUnavailableDetailsURL(candidates, unavailableDetailsURLs)
+	candidates = filterCandidates(candidates, isAIOStreams, filteringActive, unavailableDetailsURLs)
+	unavailableKnownCount := 0
+	if source != nil && len(source.UnavailableDetailsURLs) > 0 {
+		unavailableKnownCount = len(source.UnavailableDetailsURLs)
+	}
+	logAvailReportedBadFiltering(stream, availReportedBadFilteringEnabled, availFilteredOut, unavailableKnownCount)
 	if !filteringActive {
 		return candidates
 	}
 	inputResults := len(candidates)
-	candidates = filterCandidates(candidates, isAIOStreams, filteringActive, source.UnavailableDetailsURLs)
 	candidates = s.filterCachedUnhealthyCandidates(candidates, source.Avail, filteringActive, stream)
 	logStreamFiltering(stream, filterMode, inputResults, len(candidates))
 	return candidates
@@ -763,6 +848,36 @@ func logStreamFiltering(stream *auth.Stream, filterMode string, inputResults, fi
 		"mode", filterMode,
 		"input_results", inputResults,
 		"final_results", finalResults,
+	)
+}
+
+func countCandidatesByUnavailableDetailsURL(candidates []triage.Candidate, unavailableDetailsURLs map[string]bool) int {
+	if len(candidates) == 0 || len(unavailableDetailsURLs) == 0 {
+		return 0
+	}
+	filtered := 0
+	for _, c := range candidates {
+		if c.Release == nil || c.Release.DetailsURL == "" {
+			continue
+		}
+		if unavailableDetailsURLs[c.Release.DetailsURL] {
+			filtered++
+		}
+	}
+	return filtered
+}
+
+func logAvailReportedBadFiltering(stream *auth.Stream, enabled bool, availFilteredOut, unavailableKnown int) {
+	logger.Debug("AvailNZB reported-bad filtering",
+		"stream", func() string {
+			if stream != nil {
+				return stream.Username
+			}
+			return "legacy"
+		}(),
+		"enabled", enabled,
+		"avail_filtered_out", availFilteredOut,
+		"known_unavailable", unavailableKnown,
 	)
 }
 

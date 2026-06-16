@@ -50,6 +50,40 @@ const (
 	nzbAttemptsIndexStream   = `CREATE INDEX IF NOT EXISTS idx_nzb_attempts_stream_name ON nzb_attempts(stream_name);`
 	nzbAttemptsIndexProvider = `CREATE INDEX IF NOT EXISTS idx_nzb_attempts_provider_name ON nzb_attempts(provider_name);`
 	nzbAttemptsIndexIndexer  = `CREATE INDEX IF NOT EXISTS idx_nzb_attempts_indexer_name ON nzb_attempts(indexer_name);`
+
+	providerMetricsSchema = `CREATE TABLE IF NOT EXISTS provider_metrics (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		collected_at INTEGER NOT NULL,
+		provider_name TEXT NOT NULL,
+		host TEXT,
+		active_conns INTEGER NOT NULL DEFAULT 0,
+		idle_conns INTEGER NOT NULL DEFAULT 0,
+		max_conns INTEGER NOT NULL DEFAULT 0,
+		current_speed_mbps REAL NOT NULL DEFAULT 0,
+		downloaded_mb REAL NOT NULL DEFAULT 0,
+		usage_percent REAL NOT NULL DEFAULT 0,
+		article_available_count INTEGER NOT NULL DEFAULT 0,
+		article_missing_count INTEGER NOT NULL DEFAULT 0
+	);`
+	providerMetricsIndexTime = `CREATE INDEX IF NOT EXISTS idx_provider_metrics_collected_at ON provider_metrics(collected_at DESC);`
+	providerMetricsIndexName = `CREATE INDEX IF NOT EXISTS idx_provider_metrics_name_time ON provider_metrics(provider_name, collected_at DESC);`
+
+	indexerMetricsSchema = `CREATE TABLE IF NOT EXISTS indexer_metrics (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		collected_at INTEGER NOT NULL,
+		indexer_name TEXT NOT NULL,
+		api_hits_used INTEGER NOT NULL DEFAULT 0,
+		api_hits_limit INTEGER NOT NULL DEFAULT 0,
+		downloads_used INTEGER NOT NULL DEFAULT 0,
+		downloads_limit INTEGER NOT NULL DEFAULT 0,
+		searches_count INTEGER NOT NULL DEFAULT 0,
+		unique_hits_count INTEGER NOT NULL DEFAULT 0,
+		avg_response_ms REAL NOT NULL DEFAULT 0.0,
+		avail_available_count INTEGER NOT NULL DEFAULT 0,
+		avail_discarded_count INTEGER NOT NULL DEFAULT 0
+	);`
+	indexerMetricsIndexTime = `CREATE INDEX IF NOT EXISTS idx_indexer_metrics_collected_at ON indexer_metrics(collected_at DESC);`
+	indexerMetricsIndexName = `CREATE INDEX IF NOT EXISTS idx_indexer_metrics_name_time ON indexer_metrics(indexer_name, collected_at DESC);`
 )
 
 func openDB(dataDir string) (*sql.DB, error) {
@@ -71,10 +105,30 @@ func openDB(dataDir string) (*sql.DB, error) {
 }
 
 func initSchema(db *sql.DB) error {
-	for _, stmt := range []string{kvSchema, nzbAttemptsSchema, nzbAttemptsIndexTried, nzbAttemptsIndexContent} {
+	for _, stmt := range []string{
+		kvSchema,
+		nzbAttemptsSchema,
+		nzbAttemptsIndexTried,
+		nzbAttemptsIndexContent,
+		providerMetricsSchema,
+		providerMetricsIndexTime,
+		providerMetricsIndexName,
+		indexerMetricsSchema,
+		indexerMetricsIndexTime,
+		indexerMetricsIndexName,
+	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("schema: %w", err)
 		}
+	}
+	if err := migrateProviderMetricsArticleAvailableCount(db); err != nil {
+		return err
+	}
+	if err := migrateProviderMetricsArticleMissingCount(db); err != nil {
+		return err
+	}
+	if err := migrateIndexerMetricsUniqueHitsCount(db); err != nil {
+		return err
 	}
 	if err := migrateNzbAttemptsPreload(db); err != nil {
 		return err
@@ -169,6 +223,30 @@ func migrateNzbAttemptsAvailReason(db *sql.DB) error {
 	_, err := db.Exec(`ALTER TABLE nzb_attempts ADD COLUMN avail_reason TEXT`)
 	if err != nil && !strings.Contains(err.Error(), "duplicate column") {
 		return fmt.Errorf("migrate nzb_attempts.avail_reason: %w", err)
+	}
+	return nil
+}
+
+func migrateProviderMetricsArticleAvailableCount(db *sql.DB) error {
+	_, err := db.Exec(`ALTER TABLE provider_metrics ADD COLUMN article_available_count INTEGER NOT NULL DEFAULT 0`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate provider_metrics.article_available_count: %w", err)
+	}
+	return nil
+}
+
+func migrateProviderMetricsArticleMissingCount(db *sql.DB) error {
+	_, err := db.Exec(`ALTER TABLE provider_metrics ADD COLUMN article_missing_count INTEGER NOT NULL DEFAULT 0`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate provider_metrics.article_missing_count: %w", err)
+	}
+	return nil
+}
+
+func migrateIndexerMetricsUniqueHitsCount(db *sql.DB) error {
+	_, err := db.Exec(`ALTER TABLE indexer_metrics ADD COLUMN unique_hits_count INTEGER NOT NULL DEFAULT 0`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate indexer_metrics.unique_hits_count: %w", err)
 	}
 	return nil
 }

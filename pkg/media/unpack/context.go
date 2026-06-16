@@ -3,7 +3,80 @@ package unpack
 import (
 	"context"
 	"errors"
+	"fmt"
 )
+
+type archiveFastFailoverContextKey struct{}
+type archiveScanIOTraceContextKey struct{}
+type skipGapProbingContextKey struct{}
+
+func WithSkipGapProbing(ctx context.Context, enabled bool) context.Context {
+	if !enabled {
+		return ctx
+	}
+	return context.WithValue(ctx, skipGapProbingContextKey{}, true)
+}
+
+func IsSkipGapProbingEnabled(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(skipGapProbingContextKey{}).(bool)
+	return enabled
+}
+
+func WithArchiveFastFailoverMode(ctx context.Context, enabled bool) context.Context {
+	if !enabled {
+		return ctx
+	}
+	return context.WithValue(ctx, archiveFastFailoverContextKey{}, true)
+}
+
+func WithArchiveScanIOTrace(ctx context.Context) context.Context {
+	return context.WithValue(ctx, archiveScanIOTraceContextKey{}, true)
+}
+
+func IsArchiveScanIOTraceEnabled(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(archiveScanIOTraceContextKey{}).(bool)
+	return enabled
+}
+
+func IsArchiveFastFailoverModeEnabled(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(archiveFastFailoverContextKey{}).(bool)
+	return enabled
+}
+
+// playbackSegmentMapCtx returns a context for on-demand segment-map detection during
+// playback reads/seeks. It skips expensive gap probing and middle calibration that
+// are only needed for one-time archive sizing.
+func playbackSegmentMapCtx(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return WithArchiveFastFailoverMode(WithSkipGapProbing(ctx, true), true)
+}
+
+var ErrArchiveFastProbe = errors.New("archive fast probe incomplete")
+
+func markArchiveFastProbe(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", ErrArchiveFastProbe, err)
+}
+
+func maybeMarkArchiveFastProbe(ctx context.Context, err error) error {
+	if err == nil || !IsArchiveFastFailoverModeEnabled(ctx) {
+		return err
+	}
+	return markArchiveFastProbe(err)
+}
 
 type contextAwareSegmentMapEnsurer interface {
 	EnsureSegmentMapCtx(ctx context.Context) error

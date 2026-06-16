@@ -7,8 +7,11 @@ import (
 	"time"
 
 	"streamnzb/pkg/core/logger"
+	"streamnzb/pkg/core/persistence"
 	"streamnzb/pkg/indexer"
+	"streamnzb/pkg/server/stremio"
 	"streamnzb/pkg/session"
+	usenetpool "streamnzb/pkg/usenet/pool"
 )
 
 type SystemStats struct {
@@ -24,26 +27,33 @@ type SystemStats struct {
 }
 
 type IndexerStats struct {
-	Name                 string `json:"name"`
-	APIHitsLimit         int    `json:"api_hits_limit"`
-	APIHitsUsed          int    `json:"api_hits_used"`
-	APIHitsRemaining     int    `json:"api_hits_remaining"`
-	AllTimeAPIHitsUsed   int    `json:"api_hits_used_all_time"`
-	DownloadsLimit       int    `json:"downloads_limit"`
-	DownloadsUsed        int    `json:"downloads_used"`
-	DownloadsRemaining   int    `json:"downloads_remaining"`
-	AllTimeDownloadsUsed int    `json:"downloads_used_all_time"`
+	Name                 string  `json:"name"`
+	APIHitsLimit         int     `json:"api_hits_limit"`
+	APIHitsUsed          int     `json:"api_hits_used"`
+	APIHitsRemaining     int     `json:"api_hits_remaining"`
+	AllTimeAPIHitsUsed   int     `json:"api_hits_used_all_time"`
+	DownloadsLimit       int     `json:"downloads_limit"`
+	DownloadsUsed        int     `json:"downloads_used"`
+	DownloadsRemaining   int     `json:"downloads_remaining"`
+	AllTimeDownloadsUsed int     `json:"downloads_used_all_time"`
+	SearchesCount        int     `json:"searches_count"`
+	UniqueHitsCount      int64   `json:"unique_hits_count"`
+	AvgResponseMS        float64 `json:"avg_response_ms"`
+	AvailAvailableCount  int64   `json:"avail_available_count"`
+	AvailDiscardedCount  int64   `json:"avail_discarded_count"`
 }
 
 type ProviderStats struct {
-	Name         string  `json:"name"`
-	Host         string  `json:"host"`
-	ActiveConns  int     `json:"active_conns"`
-	IdleConns    int     `json:"idle_conns"`
-	MaxConns     int     `json:"max_conns"`
-	CurrentSpeed float64 `json:"current_speed_mbps"`
-	DownloadedMB float64 `json:"downloaded_mb"`
-	UsagePercent float64 `json:"usage_percent"`
+	Name                  string  `json:"name"`
+	Host                  string  `json:"host"`
+	ActiveConns           int     `json:"active_conns"`
+	IdleConns             int     `json:"idle_conns"`
+	MaxConns              int     `json:"max_conns"`
+	CurrentSpeed          float64 `json:"current_speed_mbps"`
+	DownloadedMB          float64 `json:"downloaded_mb"`
+	UsagePercent          float64 `json:"usage_percent"`
+	ArticleAvailableCount int64   `json:"article_available_count"`
+	ArticleMissingCount   int64   `json:"article_missing_count"`
 }
 
 func (s *Server) collectStats() SystemStats {
@@ -58,7 +68,20 @@ func (s *Server) collectStats() SystemStats {
 
 	s.mu.RLock()
 	pools := s.providerPools
+	application := s.app
 	s.mu.RUnlock()
+	articleByProvider := map[string]usenetpool.ProviderArticleStats{}
+	articleByHost := map[string]usenetpool.ProviderArticleStats{}
+	if application != nil {
+		if comp := application.Components(); comp != nil && comp.UsenetPool != nil {
+			for _, providerStat := range comp.UsenetPool.ProviderArticleStats() {
+				articleByProvider[providerStat.ProviderID] = providerStat
+				if providerStat.Host != "" {
+					articleByHost[providerStat.Host] = providerStat
+				}
+			}
+		}
+	}
 
 	for name, pool := range pools {
 		downloadedMB := pool.TotalMegabytes()
@@ -71,6 +94,13 @@ func (s *Server) collectStats() SystemStats {
 			MaxConns:     pool.MaxConn(),
 			CurrentSpeed: pool.GetSpeed(),
 			DownloadedMB: downloadedMB,
+		}
+		if articleStat, ok := articleByProvider[name]; ok {
+			pStats.ArticleAvailableCount = articleStat.AvailableCount
+			pStats.ArticleMissingCount = articleStat.UnavailableCount
+		} else if articleStat, ok := articleByHost[pStats.Host]; ok {
+			pStats.ArticleAvailableCount = articleStat.AvailableCount
+			pStats.ArticleMissingCount = articleStat.UnavailableCount
 		}
 
 		totalActive += pStats.ActiveConns
@@ -93,6 +123,12 @@ func (s *Server) collectStats() SystemStats {
 	})
 
 	if s.indexer != nil {
+		availIndexerStats := map[string]stremio.AvailIndexerStats{}
+		uniqueIndexerHits := map[string]int64{}
+		if s.strmServer != nil {
+			availIndexerStats = s.strmServer.GetAvailIndexerStats()
+			uniqueIndexerHits = s.strmServer.GetUniqueIndexerHits()
+		}
 
 		type indexerContainer interface {
 			GetIndexers() []indexer.Indexer
@@ -117,6 +153,11 @@ func (s *Server) collectStats() SystemStats {
 				DownloadsUsed:        usage.DownloadsUsed,
 				DownloadsRemaining:   usage.DownloadsRemaining,
 				AllTimeDownloadsUsed: usage.AllTimeDownloadsUsed,
+				SearchesCount:        usage.SearchesCount,
+				UniqueHitsCount:      uniqueIndexerHits[idx.Name()],
+				AvgResponseMS:        usage.AvgResponseMS,
+				AvailAvailableCount:  availIndexerStats[idx.Name()].AvailableReturned,
+				AvailDiscardedCount:  availIndexerStats[idx.Name()].Discarded,
 			})
 		}
 	}
@@ -172,6 +213,75 @@ func (s *Server) collectStats() SystemStats {
 
 	stats.ActiveStreams = len(stats.ActiveSessions)
 
+	s.maybePersistMetrics(stats)
+
 	logger.Trace("collectStats done", "providers", len(stats.Providers), "sessions", len(stats.ActiveSessions))
 	return stats
+}
+
+func (s *Server) maybePersistMetrics(stats SystemStats) {
+	mgr := s.attemptLister
+	if mgr == nil {
+		return
+	}
+	now := time.Now()
+	const metricsInterval = 30 * time.Second
+
+	s.metricsMu.Lock()
+	if s.metricsInFlight {
+		s.metricsMu.Unlock()
+		return
+	}
+	if !s.lastMetricsAt.IsZero() && now.Sub(s.lastMetricsAt) < metricsInterval {
+		s.metricsMu.Unlock()
+		return
+	}
+	s.metricsInFlight = true
+	s.metricsMu.Unlock()
+
+	providers := make([]persistence.ProviderMetric, 0, len(stats.Providers))
+	for _, p := range stats.Providers {
+		providers = append(providers, persistence.ProviderMetric{
+			CollectedAt:      now,
+			ProviderName:     p.Name,
+			Host:             p.Host,
+			ActiveConns:      p.ActiveConns,
+			IdleConns:        p.IdleConns,
+			MaxConns:         p.MaxConns,
+			CurrentSpeedMbps: p.CurrentSpeed,
+			DownloadedMB:     p.DownloadedMB,
+			UsagePercent:     p.UsagePercent,
+			ArticleAvailable: p.ArticleAvailableCount,
+			ArticleMissing:   p.ArticleMissingCount,
+		})
+	}
+
+	indexers := make([]persistence.IndexerMetric, 0, len(stats.Indexers))
+	for _, idx := range stats.Indexers {
+		indexers = append(indexers, persistence.IndexerMetric{
+			CollectedAt:         now,
+			IndexerName:         idx.Name,
+			APIHitsUsed:         idx.APIHitsUsed,
+			APIHitsLimit:        idx.APIHitsLimit,
+			DownloadsUsed:       idx.DownloadsUsed,
+			DownloadsLimit:      idx.DownloadsLimit,
+			SearchesCount:       idx.SearchesCount,
+			UniqueHitsCount:     idx.UniqueHitsCount,
+			AvgResponseMS:       idx.AvgResponseMS,
+			AvailAvailableCount: idx.AvailAvailableCount,
+			AvailDiscardedCount: idx.AvailDiscardedCount,
+		})
+	}
+
+	if err := mgr.RecordMetricsSnapshot(providers, indexers); err != nil {
+		s.metricsMu.Lock()
+		s.metricsInFlight = false
+		s.metricsMu.Unlock()
+		logger.Warn("Failed to persist metrics snapshot", "err", err)
+		return
+	}
+	s.metricsMu.Lock()
+	s.lastMetricsAt = now
+	s.metricsInFlight = false
+	s.metricsMu.Unlock()
 }

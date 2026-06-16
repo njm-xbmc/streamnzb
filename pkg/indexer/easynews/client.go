@@ -19,6 +19,7 @@ import (
 	"streamnzb/pkg/core/env"
 	"streamnzb/pkg/core/logger"
 	"streamnzb/pkg/indexer"
+	"streamnzb/pkg/indexer/httpproxy"
 	"streamnzb/pkg/media/nzb"
 	"streamnzb/pkg/release"
 )
@@ -32,6 +33,7 @@ type Client struct {
 	username        string
 	password        string
 	name            string
+	grabHeader      string
 	client          *http.Client
 	downloadClient  *http.Client
 	downloadBase    string
@@ -44,6 +46,8 @@ type Client struct {
 	downloadLimit     int
 	downloadUsed      int
 	downloadRemaining int
+	searchesCount     int
+	totalResponseMS   int64
 	usageManager      *indexer.UsageManager
 	requestLimiter    *indexer.RequestLimiter
 	mu                sync.RWMutex
@@ -51,7 +55,7 @@ type Client struct {
 
 var _ indexer.Indexer = (*Client)(nil)
 
-func NewClient(username, password, name string, downloadBase string, apiLimit, downloadLimit, rateLimitRPS, timeoutSeconds int, um *indexer.UsageManager) (*Client, error) {
+func NewClient(username, password, name string, downloadBase string, apiLimit, downloadLimit, rateLimitRPS, timeoutSeconds int, proxyURL, grabHeader string, um *indexer.UsageManager) (*Client, error) {
 	if username == "" || password == "" {
 		return nil, fmt.Errorf("easynews username and password are required")
 	}
@@ -61,7 +65,16 @@ func NewClient(username, password, name string, downloadBase string, apiLimit, d
 	searchTimeout := time.Duration(timeoutSeconds) * time.Second
 	downloadTimeout := searchTimeout * 2
 
-	transport := &http.Transport{
+	searchProxy := httpproxy.IndexerProxy(proxyURL)
+	searchTransport := &http.Transport{
+		Proxy:               searchProxy,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	downloadTransport := &http.Transport{
+		Proxy:               httpproxy.WithEasynewsDownloadNoProxy(searchProxy),
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 		MaxConnsPerHost:     100,
@@ -72,6 +85,7 @@ func NewClient(username, password, name string, downloadBase string, apiLimit, d
 		username:          username,
 		password:          password,
 		name:              name,
+		grabHeader:        grabHeader,
 		downloadBase:      downloadBase,
 		searchTimeout:     searchTimeout,
 		downloadTimeout:   downloadTimeout,
@@ -85,11 +99,11 @@ func NewClient(username, password, name string, downloadBase string, apiLimit, d
 		requestLimiter:    indexer.NewRequestLimiter(rateLimitRPS),
 		client: &http.Client{
 			Timeout:   searchTimeout,
-			Transport: transport,
+			Transport: searchTransport,
 		},
 		downloadClient: &http.Client{
 			Timeout:   downloadTimeout,
-			Transport: transport,
+			Transport: downloadTransport,
 		},
 	}
 
@@ -112,6 +126,13 @@ func NewClient(username, password, name string, downloadBase string, apiLimit, d
 	return c, nil
 }
 
+func (c *Client) effectiveGrabHeader() string {
+	if h := strings.TrimSpace(c.grabHeader); h != "" {
+		return h
+	}
+	return env.IndexerGrabHeader()
+}
+
 func (c *Client) Name() string {
 	if c.name != "" {
 		return c.name
@@ -130,6 +151,10 @@ func (c *Client) GetUsage() indexer.Usage {
 		DownloadsLimit:     c.downloadLimit,
 		DownloadsUsed:      c.downloadUsed,
 		DownloadsRemaining: c.downloadRemaining,
+		SearchesCount:      c.searchesCount,
+	}
+	if c.searchesCount > 0 {
+		u.AvgResponseMS = float64(c.totalResponseMS) / float64(c.searchesCount)
 	}
 	c.mu.RUnlock()
 	if usageData != nil {
@@ -163,6 +188,17 @@ func (c *Client) refreshUsageFromManager() *indexer.UsageData {
 	c.mu.Unlock()
 
 	return ud
+}
+
+func (c *Client) recordSearchDuration(elapsed time.Duration) {
+	ms := elapsed.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	c.mu.Lock()
+	c.searchesCount++
+	c.totalResponseMS += ms
+	c.mu.Unlock()
 }
 
 func (c *Client) Ping() error {
@@ -260,6 +296,7 @@ func (c *Client) Search(req indexer.SearchRequest) (*indexer.SearchResponse, err
 		"total_results", totalResults,
 		"duration_ms", time.Since(startedAt).Milliseconds(),
 	)
+	c.recordSearchDuration(time.Since(startedAt))
 
 	return &indexer.SearchResponse{
 		Channel: indexer.Channel{
@@ -481,7 +518,7 @@ func (c *Client) downloadNZBInternal(ctx context.Context, payload map[string]int
 
 	req.SetBasicAuth(c.username, c.password)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", env.IndexerGrabHeader())
+	req.Header.Set("User-Agent", c.effectiveGrabHeader())
 	resp, err := c.downloadClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("easynews NZB download request failed: %w", err)

@@ -196,6 +196,30 @@ func TestMarkPlaybackValidatedSeparatesValidationFromPlaybackEnd(t *testing.T) {
 	}
 }
 
+func TestClearBlueprintCacheClearsOnlyBlueprints(t *testing.T) {
+	logger.Init("ERROR")
+
+	sWithBlueprint := &Session{ID: "sess-1", Blueprint: &struct{ Name string }{Name: "cached"}}
+	sWithoutBlueprint := &Session{ID: "sess-2"}
+	m := &Manager{
+		sessions: map[string]*Session{
+			"sess-1": sWithBlueprint,
+			"sess-2": sWithoutBlueprint,
+		},
+	}
+
+	cleared := m.ClearBlueprintCache()
+	if cleared != 1 {
+		t.Fatalf("ClearBlueprintCache() = %d, want 1", cleared)
+	}
+	if sWithBlueprint.Blueprint != nil {
+		t.Fatalf("expected blueprint to be cleared for sess-1")
+	}
+	if sWithoutBlueprint.Blueprint != nil {
+		t.Fatalf("expected nil blueprint to remain nil for sess-2")
+	}
+}
+
 func TestCreateSessionSelectsRequestedEpisode(t *testing.T) {
 	logger.Init("ERROR")
 
@@ -860,6 +884,9 @@ func TestGetOrDownloadNZBWithContextPropagatesLeaderFailureToWaiters(t *testing.
 		t.Fatal("timed out waiting for NZB download to start")
 	}
 
+	// Give the second goroutine time to start and see the inflight download
+	time.Sleep(50 * time.Millisecond)
+
 	close(wait)
 
 	for i := 0; i < 2; i++ {
@@ -1176,3 +1203,68 @@ func marshalTestNZB(t *testing.T, doc *nzb.NZB) []byte {
 	}
 	return data
 }
+
+func TestManagerTTLConfigurationAndEviction(t *testing.T) {
+	logger.Init("ERROR")
+
+	// 1. Test thread-safe getters/setters
+	m := &Manager{
+		sessions:             make(map[string]*Session),
+		ttl:                  30 * time.Minute,
+		postPlaybackEvictTTL: 4 * time.Hour,
+	}
+
+	m.SetTTL(15 * time.Minute)
+	if m.ttl != 15*time.Minute {
+		t.Fatalf("expected ttl to be 15m, got %v", m.ttl)
+	}
+
+	m.SetPostPlaybackEvictTTL(2 * time.Hour)
+	if m.postPlaybackEvictTTL != 2*time.Hour {
+		t.Fatalf("expected postPlaybackEvictTTL to be 2h, got %v", m.postPlaybackEvictTTL)
+	}
+
+	// 2. Test evictIdle
+	// Create a session that is inactive and last accessed 10 minutes ago
+	sIdle := &Session{
+		ID:         "sess-idle",
+		LastAccess: time.Now().Add(-10 * time.Minute),
+	}
+	m.sessions["sess-idle"] = sIdle
+
+	// Under 15m TTL, it should NOT be evicted
+	m.cleanup()
+	if _, ok := m.sessions["sess-idle"]; !ok {
+		t.Fatalf("session should not have been evicted under 15m TTL")
+	}
+
+	// Under 5m TTL, it SHOULD be evicted
+	m.SetTTL(5 * time.Minute)
+	m.cleanup()
+	if _, ok := m.sessions["sess-idle"]; ok {
+		t.Fatalf("session should have been evicted under 5m TTL")
+	}
+
+	// 3. Test evictPostPlayback
+	// Create a session that has a PlaybackEndedAt set to 10 minutes ago
+	sPlaybackEnded := &Session{
+		ID:              "sess-ended",
+		LastAccess:      time.Now(), // Make sure it's not evicted by idle TTL
+		PlaybackEndedAt: time.Now().Add(-10 * time.Minute),
+	}
+	m.sessions["sess-ended"] = sPlaybackEnded
+
+	// Under 2h postPlaybackEvictTTL, it should NOT be evicted
+	m.cleanup()
+	if _, ok := m.sessions["sess-ended"]; !ok {
+		t.Fatalf("session should not have been evicted under 2h post-playback TTL")
+	}
+
+	// Under 5m postPlaybackEvictTTL, it SHOULD be evicted
+	m.SetPostPlaybackEvictTTL(5 * time.Minute)
+	m.cleanup()
+	if _, ok := m.sessions["sess-ended"]; ok {
+		t.Fatalf("session should have been evicted under 5m post-playback TTL")
+	}
+}
+

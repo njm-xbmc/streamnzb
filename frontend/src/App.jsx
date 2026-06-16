@@ -6,9 +6,11 @@ import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar"
 import { AppSidebar } from "@/components/AppSidebar"
 import { SiteHeader } from "@/components/SiteHeader"
 import { DashboardPage } from "@/components/DashboardPage"
+import { StatisticsPage } from "@/components/StatisticsPage"
 import { LogsPage } from "@/components/LogsPage"
 import { NZBHistoryPage } from "@/components/NZBHistoryPage"
 import { ProfilePage } from "@/components/ProfilePage"
+import { DirectPlayPage } from "@/components/DirectPlayPage"
 import StreamManagement from './components/StreamManagement'
 import { apiFetch, getApiUrl, UNAUTHORIZED_EVENT } from './api'
 import { AlertCircle, Loader2 } from "lucide-react"
@@ -224,7 +226,7 @@ function App() {
   if (mustChangePassword && currentUser) {
     return <ChangePassword username={currentUser} onPasswordChanged={() => {
       setMustChangePassword(false)
-    }} />
+    }} requireCurrentPassword={false} />
   }
 
   if (error && wsStatus === 'disconnected') {
@@ -254,6 +256,7 @@ function App() {
         onNavigate={setActivePage}
         version={version}
         currentUser={currentUser}
+        forcePasswordResetEnabled={Boolean(config?.env_overrides?.includes('admin_must_change_password'))}
         onLogout={handleLogout}
         theme={theme}
         onThemeChange={setTheme}
@@ -272,8 +275,14 @@ function App() {
               availNZBStatusError={availNZBStatusError}
             />
           )}
+          {activePage === 'statistics' && (
+            <StatisticsPage />
+          )}
           {activePage === 'nzb-history' && (
             <NZBHistoryPage refreshTrigger={nzbAttemptsRefreshTrigger} />
+          )}
+          {activePage === 'direct-play' && (
+            <DirectPlayPage />
           )}
           {activePage === 'install' && (
             <div className="pt-4 md:pt-5 pb-3 px-4 lg:px-5">

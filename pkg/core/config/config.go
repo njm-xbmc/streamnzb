@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,6 +26,12 @@ const (
 	DefaultEasynewsIndexerTimeoutSeconds   = 15
 	DefaultPlaybackStartupTimeoutSeconds   = 5
 	MaxPlaybackStartupTimeoutSeconds       = 60
+	DefaultSessionTTLMinutes               = 30
+	MinSessionTTLMinutes                   = 1
+	MaxSessionTTLMinutes                   = 1440
+	DefaultSessionPostPlaybackTTLMinutes   = 240
+	MinSessionPostPlaybackTTLMinutes       = 1
+	MaxSessionPostPlaybackTTLMinutes       = 1440
 	CurrentConfigVersion                   = 2
 	StreamModelConfigVersion               = 2
 	defaultMigratedStreamID                = "default"
@@ -94,16 +103,17 @@ type SearchQueryConfig struct {
 }
 
 type IndexerConfig struct {
-	Name           string `json:"name"`
-	URL            string `json:"url"`
-	APIKey         string `json:"api_key"`
-	APIPath        string `json:"api_path"`
-	Type           string `json:"type"`
-	APIHitsDay     int    `json:"api_hits_day"`
-	DownloadsDay   int    `json:"downloads_day"`
-	RateLimitRPS   int    `json:"rate_limit_rps,omitempty"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
-	Enabled        *bool  `json:"enabled,omitempty"`
+	Name                   string `json:"name"`
+	URL                    string `json:"url"`
+	APIKey                 string `json:"api_key"`
+	APIPath                string `json:"api_path"`
+	Type                   string `json:"type"`
+	APIHitsDay             int    `json:"api_hits_day"`
+	DownloadsDay           int    `json:"downloads_day"`
+	RateLimitRPS           int    `json:"rate_limit_rps,omitempty"`
+	TimeoutSeconds         int    `json:"timeout_seconds,omitempty"`
+	SearchResultsCacheTime int    `json:"search_results_cache_time,omitempty"`
+	Enabled                *bool  `json:"enabled,omitempty"`
 
 	Username string `json:"username"`
 	Password string `json:"password"`
@@ -118,6 +128,84 @@ type IndexerConfig struct {
 	SearchTitleLanguage        string `json:"search_title_language,omitempty"`
 	DisableIdSearch            *bool  `json:"disable_id_search,omitempty"`
 	DisableStringSearch        *bool  `json:"disable_string_search,omitempty"`
+
+	// ProxyURL is an optional HTTP or HTTPS proxy for this indexer (http://host:port or https://...).
+	// When empty, HTTP_PROXY / HTTPS_PROXY / NO_PROXY apply via the default proxy resolution.
+	ProxyURL string `json:"proxy_url,omitempty"`
+
+	// QueryHeader overrides the global indexer_query_header for search and capability requests to this indexer.
+	// Some indexers (e.g. SceneNZBs) gate content by User-Agent; leave empty to use the global setting.
+	QueryHeader string `json:"query_header,omitempty"`
+	// GrabHeader overrides the global indexer_grab_header for NZB download requests to this indexer.
+	// Some indexers (e.g. SceneNZBs) return different NZBs depending on the downloader UA; leave empty to use the global setting.
+	GrabHeader string `json:"grab_header,omitempty"`
+}
+
+// ValidateIndexerProxyURL returns nil if raw is empty or a valid http(s) proxy URL.
+func ValidateIndexerProxyURL(raw string) error {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("proxy URL scheme must be http or https")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("proxy URL must include a host")
+	}
+	return nil
+}
+
+// ValidateIndexerProxyReachable performs a lightweight TCP dial check to ensure
+// the proxy endpoint is reachable.
+func ValidateIndexerProxyReachable(raw string) error {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return fmt.Errorf("proxy URL must include a host")
+	}
+	port := strings.TrimSpace(u.Port())
+	if port == "" {
+		switch strings.ToLower(strings.TrimSpace(u.Scheme)) {
+		case "https":
+			port = "443"
+		default:
+			port = "80"
+		}
+	}
+	addr := net.JoinHostPort(host, port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("proxy is unreachable at %s: %w", addr, err)
+	}
+	_ = conn.Close()
+	return nil
+}
+
+// RedactProxyURLForAPI strips userinfo from a proxy URL for non-admin API responses.
+func RedactProxyURLForAPI(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	u.User = nil
+	return u.String()
 }
 
 func (ic IndexerConfig) EffectiveTimeoutSeconds() int {
@@ -153,6 +241,51 @@ func (c *Config) EffectivePlaybackStartupTimeoutSeconds() int {
 
 func (c *Config) EffectivePlaybackStartupTimeout() time.Duration {
 	return time.Duration(c.EffectivePlaybackStartupTimeoutSeconds()) * time.Second
+}
+
+func (c *Config) EffectiveFailoverFastMode() bool {
+	if c == nil {
+		return true
+	}
+	return c.FailoverFastMode
+}
+
+func normalizeSessionTTLMinutes(ttl int) int {
+	if ttl < MinSessionTTLMinutes || ttl > MaxSessionTTLMinutes {
+		return DefaultSessionTTLMinutes
+	}
+	return ttl
+}
+
+func normalizeSessionPostPlaybackTTLMinutes(ttl int) int {
+	if ttl < MinSessionPostPlaybackTTLMinutes || ttl > MaxSessionPostPlaybackTTLMinutes {
+		return DefaultSessionPostPlaybackTTLMinutes
+	}
+	return ttl
+}
+
+func (c *Config) EffectiveSessionTTLSeconds() int {
+	if c != nil {
+		return normalizeSessionTTLMinutes(c.SessionTTLMinutes) * 60
+	}
+	return DefaultSessionTTLMinutes * 60
+}
+
+func (c *Config) EffectiveSessionPostPlaybackTTLSeconds() int {
+	if c != nil {
+		return normalizeSessionPostPlaybackTTLMinutes(c.SessionPostPlaybackTTLMinutes) * 60
+	}
+	return DefaultSessionPostPlaybackTTLMinutes * 60
+}
+
+func (c *Config) EffectiveAvailNZBFilterReportedBad() bool {
+	if c != nil && NormalizeAvailNZBMode(c.AvailNZBMode) == "off" {
+		return false
+	}
+	if c != nil && c.AvailNZBFilterReportedBad != nil {
+		return *c.AvailNZBFilterReportedBad
+	}
+	return false
 }
 
 func NormalizeAvailNZBMode(mode string) string {
@@ -291,6 +424,7 @@ type Config struct {
 	IndexerQueryHeader string `json:"indexer_query_header,omitempty"`
 	IndexerGrabHeader  string `json:"indexer_grab_header,omitempty"`
 	ProviderHeader     string `json:"provider_header,omitempty"`
+	IndexerProxyURL    string `json:"indexer_proxy_url,omitempty"`
 
 	TVDBAPIKey string `json:"tvdb_api_key,omitempty"`
 
@@ -312,11 +446,22 @@ type Config struct {
 
 	// PlaybackStartupTimeoutSeconds bounds probe/open work before the first playable response is ready. Default 5.
 	PlaybackStartupTimeoutSeconds int `json:"playback_startup_timeout_seconds,omitempty"`
+	// SessionTTLMinutes controls how long a deferred/inactive stream session is kept in memory. Default 30.
+	SessionTTLMinutes int `json:"session_ttl_minutes,omitempty"`
+	// SessionPostPlaybackTTLMinutes controls how long a session stays in memory after playback ends (paused/stopped). Default 240 (4 hours).
+	SessionPostPlaybackTTLMinutes int `json:"session_post_playback_ttl_minutes,omitempty"`
+	// FailoverFastMode favors quick failover over exhaustive diagnosis. When enabled,
+	// playback skips expensive archive checks that can delay startup.
+	FailoverFastMode bool `json:"failover_fast_mode"`
 
 	// AvailNZBMode controls how the AvailNZB integration behaves.
 	// "on"  - fetch availability status and report playback results.
 	// "off" - disable AvailNZB entirely (no GET, no POST).
 	AvailNZBMode string `json:"availnzb_mode,omitempty"`
+
+	// AvailNZBFilterReportedBad controls whether releases reported as unavailable
+	// by AvailNZB are filtered out of playlist candidates.
+	AvailNZBFilterReportedBad *bool `json:"availnzb_filter_reported_bad,omitempty"`
 
 	LoadedPath string `json:"-"`
 
@@ -333,6 +478,8 @@ type StreamEntry struct {
 	CombineResults      *bool                          `json:"combine_results,omitempty"`
 	EnableFailover      *bool                          `json:"enable_failover,omitempty"`
 	ResultsMode         string                         `json:"results_mode,omitempty"`
+	AutoAddProviders    *bool                          `json:"auto_add_providers,omitempty"`
+	AutoAddIndexers     *bool                          `json:"auto_add_indexers,omitempty"`
 	ProviderSelections  []string                       `json:"provider_selections,omitempty"`
 	IndexerSelections   []string                       `json:"indexer_selections,omitempty"`
 	IndexerOverrides    map[string]IndexerSearchConfig `json:"indexer_overrides,omitempty"`
@@ -534,6 +681,9 @@ func Load() (*Config, error) {
 		KeepLogFiles:                  9,
 		NZBHistoryRetentionDays:       90,
 		PlaybackStartupTimeoutSeconds: DefaultPlaybackStartupTimeoutSeconds,
+		SessionTTLMinutes:             DefaultSessionTTLMinutes,
+		SessionPostPlaybackTTLMinutes: DefaultSessionPostPlaybackTTLMinutes,
+		FailoverFastMode:              true,
 		LoadedPath:                    configPath,
 	}
 
@@ -573,8 +723,20 @@ func Load() (*Config, error) {
 		cfg.PlaybackStartupTimeoutSeconds = normalized
 		needSave = true
 	}
+	if normalized := normalizeSessionTTLMinutes(cfg.SessionTTLMinutes); normalized != cfg.SessionTTLMinutes {
+		cfg.SessionTTLMinutes = normalized
+		needSave = true
+	}
+	if normalized := normalizeSessionPostPlaybackTTLMinutes(cfg.SessionPostPlaybackTTLMinutes); normalized != cfg.SessionPostPlaybackTTLMinutes {
+		cfg.SessionPostPlaybackTTLMinutes = normalized
+		needSave = true
+	}
 	if normalizedMode := NormalizeAvailNZBMode(cfg.AvailNZBMode); normalizedMode != cfg.AvailNZBMode {
 		cfg.AvailNZBMode = normalizedMode
+		needSave = true
+	}
+	if cfg.AvailNZBFilterReportedBad == nil {
+		cfg.AvailNZBFilterReportedBad = ptrBool(false)
 		needSave = true
 	}
 
@@ -795,6 +957,8 @@ func (c *Config) ensureDefaultMigratedStream() bool {
 		CombineResults:      ptrBool(true),
 		EnableFailover:      ptrBool(true),
 		ResultsMode:         "display_all",
+		AutoAddProviders:    ptrBool(true),
+		AutoAddIndexers:     ptrBool(true),
 		IndexerOverrides:    make(map[string]IndexerSearchConfig),
 		ProviderSelections:  allProviderNames(c.Providers),
 		IndexerSelections:   allIndexerNames(c.Indexers),
@@ -1034,6 +1198,9 @@ func ApplyEnvOverrides(cfg *Config, o env.ConfigOverrides, keys []string) {
 	if keySet(keys, env.KeyAdminUsername) {
 		cfg.AdminUsername = o.AdminUsername
 	}
+	if keySet(keys, env.KeyAdminMustChangePwd) {
+		cfg.AdminMustChangePassword = o.AdminMustChangePwd
+	}
 	if keySet(keys, env.KeyProviders) {
 		cfg.Providers = make([]Provider, len(o.Providers))
 		for i, p := range o.Providers {
@@ -1089,6 +1256,7 @@ func (c *Config) RedactForAPI() Config {
 	out.IndexerQueryHeader = ""
 	out.IndexerGrabHeader = ""
 	out.ProviderHeader = ""
+	out.IndexerProxyURL = RedactProxyURLForAPI(c.IndexerProxyURL)
 	out.AvailNZBAPIKey = ""
 	out.TMDBAPIKey = ""
 	out.TVDBAPIKey = ""
@@ -1105,6 +1273,7 @@ func (c *Config) RedactForAPI() Config {
 		redactedIndexer.APIKey = ""
 		redactedIndexer.Username = ""
 		redactedIndexer.Password = ""
+		redactedIndexer.ProxyURL = RedactProxyURLForAPI(indexer.ProxyURL)
 		out.Indexers[i] = redactedIndexer
 	}
 	return out
@@ -1149,6 +1318,8 @@ func CopyEnvOverridesFrom(src, dst *Config) {
 			dst.ProxyAuthPass = src.ProxyAuthPass
 		case env.KeyAdminUsername:
 			dst.AdminUsername = src.AdminUsername
+		case env.KeyAdminMustChangePwd:
+			dst.AdminMustChangePassword = src.AdminMustChangePassword
 		case env.KeyProviders:
 			dst.Providers = make([]Provider, len(src.Providers))
 			for i, p := range src.Providers {

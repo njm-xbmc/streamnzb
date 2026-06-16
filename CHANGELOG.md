@@ -1,5 +1,67 @@
 # Changelog
 
+## [4.7.0](https://github.com/Gaisberg/streamnzb/compare/v4.6.0...v4.7.0) (2026-06-01)
+
+
+### Features
+
+* **settings:** allow renaming configured providers and indexers ([f698a18](https://github.com/Gaisberg/streamnzb/commit/f698a18354c8b6e88198a8a0a6793f2eab5b7a7c))
+* **stats:** article and unique indexer hits ([82eefe3](https://github.com/Gaisberg/streamnzb/commit/82eefe3df551dc65ad7fda2f9f2b52689612c483))
+* **ui:** add full-screen Plyr overlay for direct NZB playback ([a0d3142](https://github.com/Gaisberg/streamnzb/commit/a0d31423cb517271982d8d5fbe969b32d4fb0553))
+
+
+### Bug Fixes
+
+* **frontend:** download logs with authenticated fetch ([f5f021d](https://github.com/Gaisberg/streamnzb/commit/f5f021da794d477e80b51de496c6d3a0e7f6f700))
+
+## [4.6.0](https://github.com/Gaisberg/streamnzb/compare/v4.5.0...v4.6.0) (2026-05-22)
+
+
+### Features
+
+* **playback:** recover play requests after cache/session eviction ([0834fca](https://github.com/Gaisberg/streamnzb/commit/0834fcaca8cbdb93229309487202354ecbdabb1d))
+
+
+### Bug Fixes
+
+* **ci:** pass release metadata to Discord notify on workflow_run ([aa34865](https://github.com/Gaisberg/streamnzb/commit/aa3486566ae3ebf19e29bd1bbd138a6db5ae7f2e))
+
+## [4.5.0](https://github.com/Gaisberg/streamnzb/compare/v4.4.0...v4.5.0) (2026-05-22)
+
+
+### Features
+
+* **indexers:** support per-indexer user agents ([#144](https://github.com/Gaisberg/streamnzb/issues/144)) ([167f5fc](https://github.com/Gaisberg/streamnzb/commit/167f5fc66421f922f8549e1de77d3a2937cb2493))
+* **streaming:** improve usenet resilience with rar scan fallback, pa… ([#145](https://github.com/Gaisberg/streamnzb/issues/145)) ([605551d](https://github.com/Gaisberg/streamnzb/commit/605551da1b0ea247269b45a4785f21e1313ccd86))
+* **streams:** add automatic provider/indexer sync with enabled-only enforcement ([0bfd6b4](https://github.com/Gaisberg/streamnzb/commit/0bfd6b4c2f24680bb3f54ce6a3346c4037735973)), closes [#133](https://github.com/Gaisberg/streamnzb/issues/133)
+
+## [4.4.0](https://github.com/Gaisberg/streamnzb/compare/v4.3.0...v4.4.0) (2026-05-15)
+
+
+### Features
+
+* indexer proxy ([930e744](https://github.com/Gaisberg/streamnzb/commit/930e744e63a126373c4788a65791e948decb526b))
+* **indexers:** add NZBHydra2 search results cachetime setting and API parameter ([0fba48d](https://github.com/Gaisberg/streamnzb/commit/0fba48dac6363395b9c292381516d5fba2a2f20c))
+
+
+### Bug Fixes
+
+* **availnzb:** make reported-bad filtering configurable ([4867cce](https://github.com/Gaisberg/streamnzb/commit/4867cce5ceef88ef0a61076fde367aad8236c671))
+* **stremio:** include indexer name in AIO stream descriptions ([48607d3](https://github.com/Gaisberg/streamnzb/commit/48607d3375a15c7f0de0a013775fe89e262fe8df))
+* **validation:** avoid stale proxy fallback and parallelize global proxy probes ([1079fc6](https://github.com/Gaisberg/streamnzb/commit/1079fc646e45fa1b8fe634c971ff4da07d642265))
+
+## [4.3.0](https://github.com/Gaisberg/streamnzb/compare/v4.2.0...v4.3.0) (2026-05-14)
+
+
+### Features
+
+* **stats:** add persisted history metrics API and interactive statistics dashboard ([8091331](https://github.com/Gaisberg/streamnzb/commit/8091331454620e6044978576e7cbfbc33aeaf19a))
+
+
+### Bug Fixes
+
+* **availnzb:** report definitive unavailable releases across all providers and fix unavailable discard stats tracking ([d922a9d](https://github.com/Gaisberg/streamnzb/commit/d922a9d6e938a88778a764513c88cc1cc311f251))
+
 ## [4.2.0](https://github.com/Gaisberg/streamnzb/compare/v4.1.0...v4.2.0) (2026-04-23)
 
 

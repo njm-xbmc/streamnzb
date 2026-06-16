@@ -10,13 +10,15 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"streamnzb/pkg/core/config"
 	"streamnzb/pkg/core/env"
 	"streamnzb/pkg/core/logger"
 	"streamnzb/pkg/indexer"
-	"strings"
-	"sync"
-	"time"
+	"streamnzb/pkg/indexer/httpproxy"
 )
 
 type Client struct {
@@ -34,6 +36,8 @@ type Client struct {
 	downloadLimit     int
 	downloadUsed      int
 	downloadRemaining int
+	searchesCount     int
+	totalResponseMS   int64
 	usageManager      *indexer.UsageManager
 	requestLimiter    *indexer.RequestLimiter
 	mu                sync.RWMutex
@@ -50,6 +54,7 @@ var orderedSearchQueryKeys = []string{
 	"season",
 	"ep",
 	"q",
+	"cachetime",
 	"offset",
 	"limit",
 	"o",
@@ -131,6 +136,10 @@ func (c *Client) GetUsage() indexer.Usage {
 		DownloadsLimit:     c.downloadLimit,
 		DownloadsUsed:      c.downloadUsed,
 		DownloadsRemaining: c.downloadRemaining,
+		SearchesCount:      c.searchesCount,
+	}
+	if c.searchesCount > 0 {
+		u.AvgResponseMS = float64(c.totalResponseMS) / float64(c.searchesCount)
 	}
 	c.mu.RUnlock()
 	if usageData != nil {
@@ -166,9 +175,21 @@ func (c *Client) refreshUsageFromManager() *indexer.UsageData {
 	return ud
 }
 
+func (c *Client) recordSearchDuration(elapsed time.Duration) {
+	ms := elapsed.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	c.mu.Lock()
+	c.searchesCount++
+	c.totalResponseMS += ms
+	c.mu.Unlock()
+}
+
 func NewClient(cfg config.IndexerConfig, um *indexer.UsageManager) *Client {
 
 	transport := &http.Transport{
+		Proxy: httpproxy.IndexerProxy(cfg.ProxyURL),
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
 		},
@@ -224,6 +245,20 @@ func NewClient(cfg config.IndexerConfig, um *indexer.UsageManager) *Client {
 	}
 
 	return c
+}
+
+func (c *Client) effectiveQueryHeader() string {
+	if h := strings.TrimSpace(c.cfg.QueryHeader); h != "" {
+		return h
+	}
+	return env.IndexerQueryHeader()
+}
+
+func (c *Client) effectiveGrabHeader() string {
+	if h := strings.TrimSpace(c.cfg.GrabHeader); h != "" {
+		return h
+	}
+	return env.IndexerGrabHeader()
 }
 
 func (c *Client) checkAPILimit() error {
@@ -318,7 +353,7 @@ func (c *Client) Ping() error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", env.IndexerQueryHeader())
+	req.Header.Set("User-Agent", c.effectiveQueryHeader())
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return err
@@ -345,7 +380,7 @@ func (c *Client) GetCaps() (*indexer.Caps, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create caps request: %w", err)
 	}
-	req.Header.Set("User-Agent", env.IndexerQueryHeader())
+	req.Header.Set("User-Agent", c.effectiveQueryHeader())
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -613,6 +648,9 @@ func (c *Client) Search(req indexer.SearchRequest) (*indexer.SearchResponse, err
 	if query != "" && (isTextMode || !useTVSearchParams || (!isTextMode && useTVSearchParams && query != rawQuery)) {
 		params.Set("q", query)
 	}
+	if c.cfg.SearchResultsCacheTime > 0 && config.IsAggregatorIndexerType(c.cfg.Type) {
+		params.Set("cachetime", strconv.Itoa(c.cfg.SearchResultsCacheTime))
+	}
 
 	apiURL := fmt.Sprintf("%s%s?%s", c.baseURL, c.apiPath, encodeOrderedQuery(params, orderedSearchQueryKeys))
 	logger.Debug("Search request",
@@ -634,7 +672,7 @@ func (c *Client) Search(req indexer.SearchRequest) (*indexer.SearchResponse, err
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	httpReq.Header.Set("User-Agent", env.IndexerQueryHeader())
+	httpReq.Header.Set("User-Agent", c.effectiveQueryHeader())
 	startedAt := time.Now()
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
@@ -713,6 +751,7 @@ func (c *Client) Search(req indexer.SearchRequest) (*indexer.SearchResponse, err
 		"total_results", totalResults,
 		"duration_ms", time.Since(startedAt).Milliseconds(),
 	)
+	c.recordSearchDuration(time.Since(startedAt))
 	return &result, nil
 }
 
@@ -733,7 +772,7 @@ func (c *Client) DownloadNZB(ctx context.Context, nzbURL string) ([]byte, error)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	req.Header.Set("User-Agent", env.IndexerGrabHeader())
+	req.Header.Set("User-Agent", c.effectiveGrabHeader())
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to download NZB from %s: %w", c.Name(), err)

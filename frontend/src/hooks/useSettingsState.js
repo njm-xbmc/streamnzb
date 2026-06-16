@@ -21,8 +21,12 @@ const ADVANCED_TAB_FIELDS = [
   'keep_log_files',
   'nzb_history_retention_days',
   'playback_startup_timeout_seconds',
+  'failover_fast_mode',
+  'session_ttl_minutes',
+  'session_post_playback_ttl_minutes',
   'memory_limit_mb',
   'availnzb_mode',
+  'availnzb_filter_reported_bad',
   'tmdb_api_key',
   'tvdb_api_key',
 ]
@@ -269,6 +273,15 @@ export function useSettingsState({
       trimmedFullData.nzb_history_retention_days = Math.min(3650, Math.max(0, Number.isNaN(nzbHistoryRetention) ? 90 : nzbHistoryRetention))
       const playbackStartupTimeout = Number(trimmedFullData.playback_startup_timeout_seconds)
       trimmedFullData.playback_startup_timeout_seconds = Math.min(60, Math.max(1, Number.isNaN(playbackStartupTimeout) ? 5 : playbackStartupTimeout))
+      const sessionTtl = Number(trimmedFullData.session_ttl_minutes)
+      trimmedFullData.session_ttl_minutes = Math.min(1440, Math.max(1, Number.isNaN(sessionTtl) ? 30 : sessionTtl))
+      const postPlaybackTtl = Number(trimmedFullData.session_post_playback_ttl_minutes)
+      trimmedFullData.session_post_playback_ttl_minutes = Math.min(1440, Math.max(1, Number.isNaN(postPlaybackTtl) ? 240 : postPlaybackTtl))
+      if (trimmedFullData.failover_fast_mode == null) {
+        trimmedFullData.failover_fast_mode = true
+      } else {
+        trimmedFullData.failover_fast_mode = trimmedFullData.failover_fast_mode === true
+      }
 
       const payload = overrides
         ? Object.keys(overrides).reduce((acc, key) => {
@@ -299,19 +312,20 @@ export function useSettingsState({
         movie_search_queries: getValues('movie_search_queries'),
         series_search_queries: getValues('series_search_queries'),
       })
+      let errorMessage = error?.message || 'Failed to save configuration.'
       if (summary) {
-        error.message = summary
+        errorMessage = summary
       } else if (error?.fieldErrors) {
         const firstFieldError = Object.values(error.fieldErrors).find((message) => typeof message === 'string' && message.trim() !== '')
         if (firstFieldError) {
-          error.message = firstFieldError
+          errorMessage = firstFieldError
         }
       }
-      console.error('Error saving configuration:', error)
+      console.error('Error saving configuration:', errorMessage, error)
       if (sourceTab !== 'network' && sourceTab !== 'advanced' && sourceTab !== 'providers' && sourceTab !== 'indexers') {
-        showFooterStatus({ type: 'error', message: error.message || 'Failed to save configuration.' })
+        showFooterStatus({ type: 'error', message: errorMessage })
       }
-      setError('root', { message: `Failed to save configuration: ${error.message}` })
+      setError('root', { message: `Failed to save configuration: ${errorMessage}` })
       throw error
     }
   }, [activeTab, configSnapshot, getValues, sendCommand, setConfigSnapshot, setError, showFooterStatus])

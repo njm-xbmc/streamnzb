@@ -84,6 +84,8 @@ type File struct {
 
 	zeroFillMu    sync.Mutex
 	zeroFillCount int
+
+	segmentDetectMu sync.Mutex
 }
 
 type inflightSegmentDownload struct {
@@ -180,23 +182,54 @@ func (f *File) EnsureSegmentMap() error {
 }
 
 func (f *File) EnsureSegmentMapCtx(ctx context.Context) error {
+	f.segmentDetectMu.Lock()
+	defer f.segmentDetectMu.Unlock()
+
 	f.mu.Lock()
 	if f.detected {
 		f.mu.Unlock()
 		return nil
 	}
 	f.mu.Unlock()
-	return f.detectSegmentSize(ctx)
+
+	return f.detectSegmentSizeLocked(ctx)
 }
 
-func (f *File) detectSegmentSize(ctx context.Context) error {
-	f.mu.Lock()
-	if f.detected {
-		f.mu.Unlock()
-		return nil
+// PrimeUniformSegmentMapFromEstimator builds a segment map without NNTP probes when
+// every segment (including the last) shares the same NZB bytes and the estimator
+// already knows the decoded size from an earlier volume in the same release.
+func (f *File) PrimeUniformSegmentMapFromEstimator() bool {
+	if f == nil || len(f.segments) == 0 || f.estimator == nil {
+		return false
 	}
-	f.mu.Unlock()
+	if !hasUniformNZBSegmentBytes(f.segments) {
+		return false
+	}
+	first := f.segments[0]
+	decoded, ok := f.estimator.Get(first.Bytes)
+	if !ok || decoded <= 0 {
+		return false
+	}
 
+	knownByNZBBytes := map[int64]int64{first.Bytes: decoded}
+	sizes := buildSegmentDecodedSizesFromProbes(f.segments, nil, knownByNZBBytes, true)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.detected {
+		return true
+	}
+	f.totalSize = applySegmentDecodedSizes(f.segments, sizes)
+	f.detected = true
+	logger.Trace("Primed uniform segment map from estimator",
+		"name", f.Name(),
+		"size", f.totalSize,
+		"segments", len(f.segments),
+		"decoded", decoded)
+	return true
+}
+
+func (f *File) detectSegmentSizeLocked(ctx context.Context) error {
 	if ctx == nil {
 		ctx = f.ctx
 	}
@@ -207,6 +240,17 @@ func (f *File) detectSegmentSize(ctx context.Context) error {
 		return err
 	}
 
+	f.mu.Lock()
+	if f.detected {
+		f.mu.Unlock()
+		return nil
+	}
+	f.mu.Unlock()
+
+	if unpack.IsArchiveFastFailoverModeEnabled(ctx) && f.PrimeUniformSegmentMapFromEstimator() {
+		return nil
+	}
+
 	if len(f.segments) == 0 {
 		f.mu.Lock()
 		f.totalSize = 0
@@ -215,41 +259,59 @@ func (f *File) detectSegmentSize(ctx context.Context) error {
 		return nil
 	}
 
-	firstEncoded := f.segments[0].Bytes
-	segSize := int64(0)
-	usedEstimator := false
+	knownByNZBBytes := make(map[int64]int64)
 	if f.estimator != nil {
-		if decoded, ok := f.estimator.Get(firstEncoded); ok {
-			segSize = decoded
-			usedEstimator = true
+		if decoded, ok := f.estimator.Get(f.segments[0].Bytes); ok {
+			knownByNZBBytes[f.segments[0].Bytes] = decoded
+			logger.Trace("Using estimated segment size", "name", f.Name(), "size", decoded)
 		}
 	}
 
-	if !usedEstimator {
-		data, err := f.DownloadSegment(ctx, 0)
-		if err != nil {
-			return err
-		}
-		if len(data) == 0 {
-			return errors.New("empty first segment")
-		}
-		segSize = int64(len(data))
+	includeMiddle := shouldProbeMiddleSegment(ctx, f.segments)
+	indices := segmentProbeIndices(f.segments, knownByNZBBytes, includeMiddle, unpack.IsSkipGapProbingEnabled(ctx))
+	logSegmentProbePlan(ctx, f.Name(), f.segments, indices, knownByNZBBytes, includeMiddle)
+
+	probedByIndex, err := f.probeSegmentIndicesParallel(ctx, indices)
+	if err != nil {
+		return err
 	}
 
-	lastSegSize := segSize
-	lastIdx := len(f.segments) - 1
-	if lastIdx > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
+	if !unpack.IsSkipGapProbingEnabled(ctx) {
+		if missing := segmentUnprobedIndices(len(f.segments), indices); len(missing) > 0 {
+			logger.Debug("Segment map gap probe",
+				"name", f.Name(),
+				"indices", missing,
+				"count", len(missing))
+			gapProbed, gapErr := f.probeSegmentIndicesParallel(ctx, missing)
+			if gapErr != nil {
+				return gapErr
+			}
+			for idx, decoded := range gapProbed {
+				probedByIndex[idx] = decoded
+			}
 		}
-		data, err := f.DownloadSegment(ctx, lastIdx)
-		if err != nil {
-			return err
+	}
+
+	for idx, decoded := range probedByIndex {
+		if idx < 0 || idx >= len(f.segments) {
+			continue
 		}
-		if len(data) == 0 {
-			return errors.New("empty last segment")
+		logger.Debug("Detected segment size",
+			"name", f.Name(),
+			"index", idx,
+			"size", decoded,
+			"nzb_size", f.segments[idx].Bytes)
+		if idx == 0 && f.estimator != nil {
+			f.estimator.Set(f.segments[0].Bytes, decoded)
 		}
-		lastSegSize = int64(len(data))
+	}
+
+	sizes := buildSegmentDecodedSizesFromProbes(f.segments, probedByIndex, knownByNZBBytes, unpack.IsSkipGapProbingEnabled(ctx))
+	if includeMiddle {
+		mid := middleProbeIndex(len(f.segments))
+		if midDecoded, ok := probedByIndex[mid]; ok {
+			applyUniformMiddleCalibration(f.segments, sizes, mid, midDecoded)
+		}
 	}
 
 	f.mu.Lock()
@@ -257,38 +319,63 @@ func (f *File) detectSegmentSize(ctx context.Context) error {
 	if f.detected {
 		return nil
 	}
-	if usedEstimator {
-		logger.Trace("Using estimated segment size", "name", f.Name(), "size", segSize)
-	} else {
-		logger.Debug("Detected segment size", "name", f.Name(), "size", segSize, "nzb_size", f.segments[0].Bytes)
-		if f.estimator != nil {
-			f.estimator.Set(f.segments[0].Bytes, segSize)
-		}
-	}
-	if lastIdx > 0 {
-		logger.Debug("Detected last segment size", "name", f.Name(), "size", lastSegSize, "nzb_size", f.segments[lastIdx].Bytes)
-	}
-	f.applySegmentSize(segSize, lastSegSize)
+	f.totalSize = applySegmentDecodedSizes(f.segments, sizes)
+	f.detected = true
+	nzbSum := sumNZBSegmentBytes(f.segments)
+	logSegmentMapSizeCheck(f.Name(), f.segments, nzbSum, f.totalSize, probedByIndex)
+	logger.Debug("Recalculated total decoded size",
+		"name", f.Name(),
+		"size", f.totalSize,
+		"segments", len(f.segments),
+		"probed", len(probedByIndex))
 	return nil
 }
 
-func (f *File) applySegmentSize(segSize, lastSegSize int64) {
-	if lastSegSize <= 0 {
-		lastSegSize = segSize
+func logSegmentMapSizeCheck(name string, segments []*Segment, nzbSum, decodedSum int64, probedByIndex map[int]int64) {
+	attrs := []any{
+		"name", name,
+		"nzb_bytes_sum", nzbSum,
+		"decoded_sum", decodedSum,
+		"delta_decoded_minus_nzb", decodedSum - nzbSum,
+		"segments", len(segments),
 	}
-	var offset int64
-	for i := range f.segments {
-		f.segments[i].StartOffset = offset
-		currentSize := segSize
-		if i == len(f.segments)-1 {
-			currentSize = lastSegSize
+	if len(segments) > 0 && segments[0].Bytes > 0 {
+		if dec, ok := probedByIndex[0]; ok && dec > 0 {
+			attrs = append(attrs, "seg0_decode_ratio", float64(dec)/float64(segments[0].Bytes))
 		}
-		f.segments[i].EndOffset = offset + currentSize
-		offset += currentSize
 	}
-	f.totalSize = offset
-	f.detected = true
-	logger.Trace("Recalculated total decoded size", "size", f.totalSize)
+	if n := len(segments); n > 0 {
+		attrs = append(attrs, "last_nzb_bytes", segments[n-1].Bytes)
+		if dec, ok := probedByIndex[n-1]; ok {
+			attrs = append(attrs, "last_decoded", dec)
+		}
+	}
+	logger.Debug("Segment map size check", attrs...)
+}
+
+// SegmentOffsetRange returns decoded byte offsets for a segment index after map detection.
+func (f *File) SegmentOffsetRange(index int) (start, end int64, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if index < 0 || index >= len(f.segments) {
+		return 0, 0, false
+	}
+	s := f.segments[index]
+	return s.StartOffset, s.EndOffset, true
+}
+
+// segmentDecodedLen returns the virtual decoded byte length for a segment index.
+func (f *File) segmentDecodedLen(idx int) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if idx < 0 || idx >= len(f.segments) {
+		return 0
+	}
+	s := f.segments[idx]
+	if f.detected {
+		return s.EndOffset - s.StartOffset
+	}
+	return s.Bytes
 }
 
 func (f *File) FindSegmentIndex(offset int64) int {
@@ -326,6 +413,7 @@ func (f *File) doDownloadSegment(ctx context.Context, index int, countFailures b
 	// context so short-lived probe/prefetch/read cancellations do not poison a
 	// segment download that another reader may still need moments later.
 	req, leader := f.startInflightDownload(index, countFailures)
+	logger.Debug("File doDownloadSegment: start", "file", f.Name(), "index", index, "leader", leader, "countFailures", countFailures)
 	if leader {
 		go f.runInflightDownload(index, req)
 	}
@@ -333,8 +421,10 @@ func (f *File) doDownloadSegment(ctx context.Context, index int, countFailures b
 
 	select {
 	case <-ctx.Done():
+		logger.Debug("File doDownloadSegment: ctx cancelled", "file", f.Name(), "index", index, "err", ctx.Err())
 		return nil, ctx.Err()
 	case <-req.done:
+		logger.Debug("File doDownloadSegment: req done", "file", f.Name(), "index", index, "err", req.err)
 		return req.data, req.err
 	}
 }
@@ -382,6 +472,7 @@ func (f *File) releaseInflightDownloadWaiter(index int, req *inflightSegmentDown
 }
 
 func (f *File) runInflightDownload(index int, req *inflightSegmentDownload) {
+	logger.Debug("File runInflightDownload: start fetch", "file", f.Name(), "index", index, "viaFetcher", f.fetcher != nil)
 	var data []byte
 	var err error
 	if f.fetcher != nil {
@@ -389,6 +480,7 @@ func (f *File) runInflightDownload(index int, req *inflightSegmentDownload) {
 	} else {
 		data, err = f.doDownloadSegmentViaPools(req.ctx, index)
 	}
+	logger.Debug("File runInflightDownload: fetch complete", "file", f.Name(), "index", index, "err", err, "dataLen", len(data))
 
 	f.downloadMu.Lock()
 	defer f.downloadMu.Unlock()
@@ -486,6 +578,7 @@ func (f *File) doDownloadSegmentViaPools(ctx context.Context, index int) ([]byte
 	for attempt := 0; attempt < len(f.pools); attempt++ {
 		select {
 		case <-downloadCtx.Done():
+			logger.Debug("File doDownloadSegmentViaPools: downloadCtx done before attempt", "file", f.Name(), "index", index, "err", downloadCtx.Err())
 			return nil, downloadCtx.Err()
 		default:
 		}
@@ -496,6 +589,7 @@ func (f *File) doDownloadSegmentViaPools(ctx context.Context, index int) ([]byte
 
 		for i, p := range f.pools {
 			if !tried[i] {
+				logger.Debug("File doDownloadSegmentViaPools: trying pool TryGet", "file", f.Name(), "index", index, "poolIdx", i, "host", p.Host())
 				if c, ok := p.TryGet(downloadCtx); ok {
 					client = c
 					clientPool = p
@@ -508,9 +602,11 @@ func (f *File) doDownloadSegmentViaPools(ctx context.Context, index int) ([]byte
 		if client == nil {
 			for i, p := range f.pools {
 				if !tried[i] {
+					logger.Debug("File doDownloadSegmentViaPools: pool Get blocking", "file", f.Name(), "index", index, "poolIdx", i, "host", p.Host())
 					var err error
 					client, err = p.Get(downloadCtx)
 					if err != nil {
+						logger.Debug("File doDownloadSegmentViaPools: pool Get failed", "file", f.Name(), "index", index, "poolIdx", i, "host", p.Host(), "err", err)
 						tried[i] = true
 						lastErr = err
 						if errors.Is(err, context.Canceled) {
@@ -526,6 +622,7 @@ func (f *File) doDownloadSegmentViaPools(ctx context.Context, index int) ([]byte
 		}
 
 		if client == nil {
+			logger.Debug("File doDownloadSegmentViaPools: no client available from any pool", "file", f.Name(), "index", index)
 			break
 		}
 
@@ -533,8 +630,10 @@ func (f *File) doDownloadSegmentViaPools(ctx context.Context, index int) ([]byte
 			client.Group(f.nzbFile.Groups[0])
 		}
 
+		logger.Debug("File doDownloadSegmentViaPools: client body read start", "file", f.Name(), "index", index, "provider", clientPool.Host(), "article", seg.ID)
 		r, err := client.Body(seg.ID)
 		if err != nil {
+			logger.Debug("File doDownloadSegmentViaPools: client body command failed", "file", f.Name(), "index", index, "provider", clientPool.Host(), "err", err)
 			clientPool.Put(client)
 			tried[poolIdx] = true
 			lastErr = err
@@ -553,9 +652,11 @@ func (f *File) doDownloadSegmentViaPools(ctx context.Context, index int) ([]byte
 
 		select {
 		case <-downloadCtx.Done():
+			logger.Debug("File doDownloadSegmentViaPools: downloadCtx done during body read", "file", f.Name(), "index", index, "provider", clientPool.Host(), "err", downloadCtx.Err())
 			clientPool.Discard(client)
 			return nil, downloadCtx.Err()
 		case res := <-done:
+			logger.Debug("File doDownloadSegmentViaPools: body read done", "file", f.Name(), "index", index, "provider", clientPool.Host(), "err", res.err)
 			if res.err != nil {
 				clientPool.Put(client)
 				tried[poolIdx] = true
@@ -605,17 +706,35 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	totalRead := 0
 	for i := startIdx; i < len(f.segments) && totalRead < len(p); i++ {
 		seg := f.segments[i]
+		segLen := f.segmentDecodedLen(i)
 		segOff := currentOffset - seg.StartOffset
+		if segOff >= segLen {
+			continue
+		}
 
 		data, err := f.DownloadSegment(f.ctx, i)
 		if err != nil {
 			return totalRead, err
 		}
-		if segOff >= int64(len(data)) {
+
+		remain := segLen - segOff
+		avail := int64(len(data)) - segOff
+		if avail < 0 {
+			avail = 0
+		}
+		toCopy := remain
+		if avail < toCopy {
+			toCopy = avail
+		}
+		bufRoom := int64(len(p) - totalRead)
+		if bufRoom < toCopy {
+			toCopy = bufRoom
+		}
+		if toCopy <= 0 {
 			continue
 		}
 
-		copied := copy(p[totalRead:], data[segOff:])
+		copied := copy(p[totalRead:], data[segOff:segOff+toCopy])
 		totalRead += copied
 		currentOffset += int64(copied)
 	}
@@ -642,6 +761,39 @@ func (f *File) OpenReaderAt(ctx context.Context, offset int64) (io.ReadCloser, e
 		return nil, err
 	}
 	return NewSegmentReader(ctx, f, offset), nil
+}
+
+// OpenPlaybackReaderAt opens a reader with a larger read-ahead window for archive
+// playback seeks that cross RAR volume boundaries.
+func (f *File) OpenPlaybackReaderAt(ctx context.Context, offset int64) (io.ReadCloser, error) {
+	if err := f.EnsureSegmentMapCtx(ctx); err != nil {
+		return nil, err
+	}
+	return NewSegmentReaderWithReadAhead(ctx, f, offset, unpack.PlaybackReadAheadSegments), nil
+}
+
+// PrefetchPlaybackOffset warms the segment cache ahead of an upcoming volume switch.
+func (f *File) PrefetchPlaybackOffset(ctx context.Context, offset int64) {
+	if err := f.EnsureSegmentMapCtx(ctx); err != nil {
+		return
+	}
+	idx := f.FindSegmentIndex(offset)
+	if idx < 0 {
+		return
+	}
+	end := idx + unpack.PlaybackReadAheadSegments
+	if end > len(f.segments) {
+		end = len(f.segments)
+	}
+	// Bind prefetch to the lifetime of the session file context (f.ctx) rather than using context.WithoutCancel.
+	// This ensures that when the session closes, the prefetches are aborted, but they aren't cancelled by transient HTTP request timeouts.
+	bgCtx := f.ctx
+	if bgCtx == nil {
+		bgCtx = context.Background()
+	}
+	for i := idx; i < end; i++ {
+		f.ReadAheadSegment(bgCtx, i)
+	}
 }
 
 // MaxSegmentSizeEstimatorEntries caps the number of size entries to prevent unbounded growth.

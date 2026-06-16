@@ -115,11 +115,12 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	newCfg.AdminPasswordHash = currentCfg.AdminPasswordHash
 	newCfg.AdminToken = currentCfg.AdminToken
 	newCfg.AdminMustChangePassword = currentCfg.AdminMustChangePassword
-	newCfg.Streams = currentCfg.Streams
+	newCfg.Streams = cloneStreamEntries(currentCfg.Streams)
+	newCfg.ApplyProviderDefaults()
+	applyStreamAutoSelections(&newCfg)
 	if newCfg.AdminUsername == "" {
 		newCfg.AdminUsername = currentCfg.GetAdminUsername()
 	}
-	newCfg.ApplyProviderDefaults()
 	if currentLoadedPath == "" {
 		currentLoadedPath = filepath.Join(paths.GetDataDir(), "config.json")
 	}
@@ -169,9 +170,16 @@ func (s *Server) handleClearCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.strmServer.ClearSearchCaches()
+	blueprintsCleared := 0
+	if s.sessionMgr != nil {
+		blueprintsCleared = s.sessionMgr.ClearBlueprintCache()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "success",
-		"message": "Search cache cleared.",
+		"message": "Search cache and blueprint cache cleared.",
+		"details": map[string]interface{}{
+			"blueprints_cleared": blueprintsCleared,
+		},
 	})
 }

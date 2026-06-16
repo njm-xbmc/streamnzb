@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 	"time"
 
@@ -230,11 +231,21 @@ func (c *Checker) validateProviderWithClient(ctx context.Context, nzbData *nzb.N
 			return result
 		case res := <-statChan:
 			if res.err != nil {
+				if c.pool != nil && pool.IsArticleNotFoundError(res.err) {
+					c.pool.RecordProviderArticleResult(providerName, false)
+				}
 				result.Error = res.err
 				return result
 			}
 			if !res.exists {
 				missing++
+				if c.pool != nil {
+					c.pool.RecordProviderArticleResult(providerName, false)
+				}
+			} else {
+				if c.pool != nil {
+					c.pool.RecordProviderArticleResult(providerName, true)
+				}
 			}
 		}
 	}
@@ -274,6 +285,9 @@ func (c *Checker) validateProviderExtendedWithClient(ctx context.Context, nzbDat
 	for _, idx := range probeIndices {
 		body, err := client.Body(segments[idx].ID)
 		if err != nil {
+			if c.pool != nil && pool.IsArticleNotFoundError(err) {
+				c.pool.RecordProviderArticleResult(providerName, false)
+			}
 			result.Available = false
 			result.Error = fmt.Errorf("body probe segment %d: %w", idx, err)
 			logger.Debug("Extended check BODY failed", "provider", providerName, "segment", idx, "err", err)
@@ -283,6 +297,9 @@ func (c *Checker) validateProviderExtendedWithClient(ctx context.Context, nzbDat
 		frame, err := decode.DecodeToBytes(body)
 		if err != nil {
 			_, _ = io.Copy(io.Discard, body)
+			if c.pool != nil {
+				c.pool.RecordProviderArticleResult(providerName, true)
+			}
 			result.Available = false
 			result.Error = fmt.Errorf("decode probe segment %d: %w", idx, err)
 			logger.Debug("Extended check decode failed", "provider", providerName, "segment", idx, "err", err)
@@ -290,6 +307,9 @@ func (c *Checker) validateProviderExtendedWithClient(ctx context.Context, nzbDat
 			return result
 		}
 		if len(frame.Data) == 0 {
+			if c.pool != nil {
+				c.pool.RecordProviderArticleResult(providerName, true)
+			}
 			result.Available = false
 			result.Error = fmt.Errorf("probe segment %d decoded to empty data", idx)
 			logger.Debug("Extended check empty segment", "provider", providerName, "segment", idx)
@@ -301,6 +321,9 @@ func (c *Checker) validateProviderExtendedWithClient(ctx context.Context, nzbDat
 		}
 		if idx == len(segments)-1 {
 			lastSegData = frame.Data
+		}
+		if c.pool != nil {
+			c.pool.RecordProviderArticleResult(providerName, true)
 		}
 	}
 
@@ -428,7 +451,7 @@ func verifyArchiveHeader(ct string, firstSeg, lastSeg []byte, info *nzb.FileInfo
 		if err != nil {
 			return fmt.Errorf("cannot read RAR file entry: %w", err)
 		}
-		if !hdr.Stored {
+		if stored, known := rarHeaderStored(hdr); known && !stored {
 			return fmt.Errorf("RAR archive uses compression (STORE mode required for streaming)")
 		}
 	case "7z":
@@ -437,6 +460,21 @@ func verifyArchiveHeader(ct string, firstSeg, lastSeg []byte, info *nzb.FileInfo
 		}
 	}
 	return nil
+}
+
+func rarHeaderStored(hdr *rardecode.FileHeader) (bool, bool) {
+	if hdr == nil {
+		return false, false
+	}
+	v := reflect.ValueOf(hdr)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return false, false
+	}
+	field := v.Elem().FieldByName("Stored")
+	if !field.IsValid() || field.Kind() != reflect.Bool {
+		return false, false
+	}
+	return field.Bool(), true
 }
 
 func verify7zHeader(headData, tailData []byte, info *nzb.FileInfo, password string) error {

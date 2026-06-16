@@ -15,8 +15,8 @@ import { cn } from "@/lib/utils"
 const CARD_FIELDS = {
   admin: ['log_level', 'verbose_nntp_logging', 'keep_log_files', 'nzb_history_retention_days'],
   memory: ['memory_limit_mb'],
-  playback: ['playback_startup_timeout_seconds'],
-  availnzb: ['availnzb_mode'],
+  playback: ['playback_startup_timeout_seconds', 'failover_fast_mode', 'session_ttl_minutes', 'session_post_playback_ttl_minutes'],
+  availnzb: ['availnzb_mode', 'availnzb_filter_reported_bad'],
   metadata: ['tmdb_api_key', 'tvdb_api_key'],
 }
 
@@ -27,6 +27,12 @@ function pickInitialValues(values = {}) {
   const parsedPlaybackStartupTimeout = values.playback_startup_timeout_seconds == null
     ? 5
     : Number(values.playback_startup_timeout_seconds)
+  const parsedSessionTtl = values.session_ttl_minutes == null
+    ? 30
+    : Number(values.session_ttl_minutes)
+  const parsedSessionPostPlaybackTtl = values.session_post_playback_ttl_minutes == null
+    ? 240
+    : Number(values.session_post_playback_ttl_minutes)
   return {
     log_level: values.log_level ?? 'INFO',
     verbose_nntp_logging: values.verbose_nntp_logging === true,
@@ -34,7 +40,11 @@ function pickInitialValues(values = {}) {
     nzb_history_retention_days: Number.isFinite(parsedRetentionDays) ? parsedRetentionDays : 90,
     memory_limit_mb: Number(values.memory_limit_mb ?? 512),
     playback_startup_timeout_seconds: Number.isFinite(parsedPlaybackStartupTimeout) ? parsedPlaybackStartupTimeout : 5,
+    session_ttl_minutes: Number.isFinite(parsedSessionTtl) ? parsedSessionTtl : 30,
+    session_post_playback_ttl_minutes: Number.isFinite(parsedSessionPostPlaybackTtl) ? parsedSessionPostPlaybackTtl : 240,
+    failover_fast_mode: values.failover_fast_mode == null ? true : values.failover_fast_mode === true,
     availnzb_mode: normalizeAvailNZBMode(values.availnzb_mode),
+    availnzb_filter_reported_bad: values.availnzb_filter_reported_bad === true,
     tmdb_api_key: values.tmdb_api_key ?? '',
     tvdb_api_key: values.tvdb_api_key ?? '',
   }
@@ -71,7 +81,6 @@ export const AdvancedSettingsSection = forwardRef(function AdvancedSettingsSecti
   const [savingCard, setSavingCard] = useState('')
   const [clearingCache, setClearingCache] = useState(false)
   const [showClearCacheConfirm, setShowClearCacheConfirm] = useState(false)
-  const [showUnlockConfirm, setShowUnlockConfirm] = useState(false)
   const [showRestartConfirm, setShowRestartConfirm] = useState(false)
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false)
   const [pendingTabChange, setPendingTabChange] = useState('')
@@ -81,6 +90,7 @@ export const AdvancedSettingsSection = forwardRef(function AdvancedSettingsSecti
   const form = useForm({ defaultValues: defaults })
   const { control, handleSubmit, reset, getValues, formState } = form
   const watchedValues = useWatch({ control })
+  const availNZBModeEnabled = normalizeAvailNZBMode(watchedValues?.availnzb_mode) === 'on'
 
   useEffect(() => {
     const currentValues = pickInitialValues(watchedValues)
@@ -113,7 +123,7 @@ export const AdvancedSettingsSection = forwardRef(function AdvancedSettingsSecti
       setShowDiscardConfirm(true)
       return false
     },
-  }), [lastSavedValues, onProceedTabChange, reset])
+  }), [lastSavedValues, onDirtyChange, onProceedTabChange, reset])
 
   const saveCard = async (cardId) => {
     setSavingCard(cardId)
@@ -170,7 +180,6 @@ export const AdvancedSettingsSection = forwardRef(function AdvancedSettingsSecti
     showUnsavedHighlights && formState.dirtyFields?.[fieldName] && 'border-destructive ring-1 ring-destructive focus-visible:ring-destructive'
   )
   const stackedFieldRowClass = "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4"
-  const controlWideClass = "w-full min-w-0 sm:max-w-xs"
   const controlMediumClass = "w-full min-w-0 sm:max-w-[10rem]"
   const controlSelectClass = "flex h-9 w-full min-w-0 max-w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 overflow-hidden text-ellipsis whitespace-nowrap sm:max-w-[14rem]"
   const labelClass = "min-w-0 text-sm font-medium"
@@ -290,6 +299,82 @@ export const AdvancedSettingsSection = forwardRef(function AdvancedSettingsSecti
                       <FormMessage />
                     </FormItem>
                   )} />
+                  <FormField control={control} name="failover_fast_mode" render={({ field }) => (
+                    <FormItem className="relative rounded-none border-0 p-3">
+                      <div className="absolute left-3 right-3 top-0 border-t border-border/60" />
+                      <div className={stackedFieldRowClass}>
+                        <div className="sm:flex-1">
+                          <FormLabel className={labelClass}>Failover fast mode</FormLabel>
+                        </div>
+                        <FormControl>
+                          <Switch
+                            checked={field.value === true}
+                            onCheckedChange={field.onChange}
+                            className={showUnsavedHighlights && formState.dirtyFields?.failover_fast_mode ? 'ring-2 ring-destructive ring-offset-2 ring-offset-background' : ''}
+                          />
+                        </FormControl>
+                      </div>
+                      <FormDescription className="mt-3">
+                        When enabled, failover prioritizes faster startup and may skip deeper checks.
+                        When disabled, failover spends longer exhausting all options before moving on.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+                  <FormField control={control} name="session_ttl_minutes" render={({ field }) => (
+                    <FormItem className="relative rounded-none border-0 p-3">
+                      <div className="absolute left-3 right-3 top-0 border-t border-border/60" />
+                      <div className={stackedFieldRowClass}>
+                        <FormLabel className={cn(labelClass, 'sm:flex-1')}>Session inactive TTL (m)</FormLabel>
+                        <FormControl>
+                          <Input
+                            type="number"
+                            min={1}
+                            max={1440}
+                            className={fieldClassName('session_ttl_minutes', `h-9 ${controlMediumClass}`)}
+                            {...field}
+                            value={field.value ?? ''}
+                            onChange={e => {
+                              const v = e.target.value;
+                              const next = Number(v);
+                              field.onChange(v === '' ? 30 : Math.min(1440, Math.max(1, Number.isNaN(next) ? 30 : next)))
+                            }}
+                          />
+                        </FormControl>
+                      </div>
+                      <FormDescription className="mt-3">
+                        How long inactive or deferred catalog sessions stay in memory before being evicted.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+                  <FormField control={control} name="session_post_playback_ttl_minutes" render={({ field }) => (
+                    <FormItem className="relative rounded-none border-0 p-3">
+                      <div className="absolute left-3 right-3 top-0 border-t border-border/60" />
+                      <div className={stackedFieldRowClass}>
+                        <FormLabel className={cn(labelClass, 'sm:flex-1')}>Paused playback TTL (m)</FormLabel>
+                        <FormControl>
+                          <Input
+                            type="number"
+                            min={1}
+                            max={1440}
+                            className={fieldClassName('session_post_playback_ttl_minutes', `h-9 ${controlMediumClass}`)}
+                            {...field}
+                            value={field.value ?? ''}
+                            onChange={e => {
+                              const v = e.target.value;
+                              const next = Number(v);
+                              field.onChange(v === '' ? 240 : Math.min(1440, Math.max(1, Number.isNaN(next) ? 240 : next)))
+                            }}
+                          />
+                        </FormControl>
+                      </div>
+                      <FormDescription className="mt-3">
+                        How long a session stays in memory after active playback ends (e.g. when paused). Keeping this long prevents needing to reload the catalog to resume.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
                 </div>
               </CardContent>
             </Card>
@@ -323,6 +408,30 @@ export const AdvancedSettingsSection = forwardRef(function AdvancedSettingsSecti
                         </FormControl>
                       </div>
                       <FormDescription className="mt-3">Controls whether StreamNZB uses AvailNZB. API key management is automatic.</FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+                  <FormField control={control} name="availnzb_filter_reported_bad" render={({ field }) => (
+                    <FormItem className="relative rounded-none border-0 p-3">
+                      <div className="absolute left-3 right-3 top-0 border-t border-border/60" />
+                      <div className={stackedFieldRowClass}>
+                        <div className="sm:flex-1">
+                          <FormLabel className={labelClass}>Filter reported bad releases</FormLabel>
+                        </div>
+                        <FormControl>
+                          <Switch
+                            checked={availNZBModeEnabled && field.value === true}
+                            onCheckedChange={(checked) => field.onChange(checked === true)}
+                            disabled={!availNZBModeEnabled}
+                            className={showUnsavedHighlights && formState.dirtyFields?.availnzb_filter_reported_bad ? 'ring-2 ring-destructive ring-offset-2 ring-offset-background' : ''}
+                          />
+                        </FormControl>
+                      </div>
+                      <FormDescription className="mt-3">
+                        {availNZBModeEnabled
+                          ? 'When enabled, releases reported as bad by AvailNZB are removed from returned streams.'
+                          : 'Enable AvailNZB mode to control reported-bad filtering.'}
+                      </FormDescription>
                       <FormMessage />
                     </FormItem>
                   )} />

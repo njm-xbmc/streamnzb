@@ -38,6 +38,7 @@ func (s *Server) SetupRoutes(mux *http.ServeMux) {
 		if len(parts) == 2 && parts[0] != "" {
 			effectivePath = "/" + parts[1]
 		}
+		isDebugPlayRoute := strings.HasPrefix(path, "/debug/play") || strings.HasPrefix(effectivePath, "/debug/play")
 		isStremioRoute := effectivePath == "/manifest.json" || effectivePath == FailoverOrderPath || strings.HasPrefix(effectivePath, "/stream/") || strings.HasPrefix(effectivePath, "/play/") || strings.HasPrefix(effectivePath, "/next/") || strings.HasPrefix(effectivePath, "/debug/play")
 
 		if len(parts) >= 1 && parts[0] != "" {
@@ -57,20 +58,20 @@ func (s *Server) SetupRoutes(mux *http.ServeMux) {
 
 					r = r.WithContext(auth.ContextWithStream(r.Context(), stream))
 
-				} else if isStremioRoute {
+				} else if isStremioRoute && !isDebugPlayRoute {
 
 					logger.Warn("Unauthorized request - invalid stream token", "path", path, "remote", r.RemoteAddr)
 					http.Error(w, "Unauthorized", http.StatusUnauthorized)
 					return
 				}
 
-			} else if isStremioRoute {
+			} else if isStremioRoute && !isDebugPlayRoute {
 
 				logger.Warn("Unauthorized request - stream authentication unavailable", "path", path, "remote", r.RemoteAddr)
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
-		} else if isStremioRoute {
+		} else if isStremioRoute && !isDebugPlayRoute {
 
 			logger.Warn("Unauthorized request - Stremio route requires stream token", "path", path, "remote", r.RemoteAddr)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -341,6 +342,28 @@ func streamBehaviorHints(streamName, streamID string, rel *release.Release, cach
 	return h
 }
 
+func buildAIOStreamDescription(contentTitle, releaseTitle, indexerName string) string {
+	firstLine := strings.TrimSpace(contentTitle)
+	secondLine := strings.TrimSpace(releaseTitle)
+	if firstLine == "" {
+		firstLine = secondLine
+	}
+	lines := make([]string, 0, 3)
+	if firstLine != "" {
+		lines = append(lines, firstLine)
+	}
+	if secondLine != "" && secondLine != firstLine {
+		lines = append(lines, secondLine)
+	}
+	if name := strings.TrimSpace(indexerName); name != "" {
+		lines = append(lines, "🔍 "+name)
+	}
+	if len(lines) == 0 {
+		return "StreamNZB"
+	}
+	return strings.Join(lines, "\n")
+}
+
 func buildStreamsFromPlaylist(list *playlistResult, key StreamSlotKey, streamName, baseURL string, showAll bool) []Stream {
 	nameLeft := streamName
 	if nameLeft == "" {
@@ -361,7 +384,11 @@ func buildStreamsFromPlaylist(list *playlistResult, key StreamSlotKey, streamNam
 			if isAvail {
 				sName = "⚡ " + nameLeft
 			}
-			desc := "StreamNZB\n" + relTitle
+			contentTitle := ""
+			if list.Params != nil {
+				contentTitle = list.Params.ContentTitle
+			}
+			desc := buildAIOStreamDescription(contentTitle, relTitle, indexerNameFromRelease(cand.Release))
 			playPath := key.SlotPath(i)
 			if useSlotPaths {
 				playPath = list.SlotPaths[i]

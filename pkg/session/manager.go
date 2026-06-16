@@ -438,6 +438,7 @@ type Manager struct {
 	usenetPool               *pool.Pool
 	estimator                *loader.SegmentSizeEstimator
 	ttl                      time.Duration
+	postPlaybackEvictTTL     time.Duration
 	maxPlaybackDuration      time.Duration
 	mu                       sync.RWMutex
 	failoverOrder            sync.Map
@@ -680,17 +681,30 @@ func (l *playbackLease) Close() error {
 
 func NewManager(pools []*nntp.ClientPool, usenetPool *pool.Pool, ttl time.Duration) *Manager {
 	m := &Manager{
-		sessions:            make(map[string]*Session),
-		pools:               pools,
-		usenetPool:          usenetPool,
-		estimator:           loader.NewSegmentSizeEstimator(),
-		ttl:                 ttl,
-		maxPlaybackDuration: MaxPlaybackDuration,
-		stopCh:              make(chan struct{}),
+		sessions:             make(map[string]*Session),
+		pools:                pools,
+		usenetPool:           usenetPool,
+		estimator:            loader.NewSegmentSizeEstimator(),
+		ttl:                  ttl,
+		postPlaybackEvictTTL: 4 * time.Hour,
+		maxPlaybackDuration:  MaxPlaybackDuration,
+		stopCh:               make(chan struct{}),
 	}
 
 	go m.cleanupLoop()
 	return m
+}
+
+func (m *Manager) SetTTL(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ttl = d
+}
+
+func (m *Manager) SetPostPlaybackEvictTTL(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.postPlaybackEvictTTL = d
 }
 
 // Shutdown stops the background cleanup goroutine. Call during application shutdown.
@@ -780,12 +794,12 @@ func selectSessionContentFiles(nzbData *nzb.NZB, contentIDs *AvailReportMeta) []
 	if nzbData == nil {
 		return nil
 	}
-	if contentIDs != nil && contentIDs.Season > 0 && contentIDs.Episode > 0 {
-		if files := nzbData.GetSessionContentFilesForEpisode(contentIDs.Season, contentIDs.Episode); len(files) > 0 {
-			return files
-		}
+	season, episode := 0, 0
+	if contentIDs != nil {
+		season = contentIDs.Season
+		episode = contentIDs.Episode
 	}
-	return nzbData.GetContentFiles()
+	return nzbData.GetSessionContentFilesForEpisode(season, episode)
 }
 
 func buildLoaderFiles(ctx context.Context, ownerID string, contentFiles []*nzb.FileInfo, pools []*nntp.ClientPool, usenetPool loader.SegmentFetcher, estimator *loader.SegmentSizeEstimator) []*loader.File {
@@ -890,7 +904,7 @@ func (m *Manager) CreateDeferredSessionWithFetcherOutcome(sessionID, downloadURL
 }
 
 func (s *Session) GetOrDownloadNZB(manager *Manager) (*nzb.NZB, error) {
-	return s.GetOrDownloadNZBWithContext(nil, manager)
+	return s.GetOrDownloadNZBWithContext(context.TODO(), manager)
 }
 
 func (s *Session) GetOrDownloadNZBWithContext(ctx context.Context, manager *Manager) (*nzb.NZB, error) {
@@ -1320,6 +1334,35 @@ func (m *Manager) DeleteSession(sessionID string) {
 	}
 }
 
+// ClearBlueprintCache clears cached playback blueprints from active sessions so
+// subsequent playback opens rebuild unpack selection state.
+func (m *Manager) ClearBlueprintCache() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	snapshot := make([]*Session, 0, len(m.sessions))
+	for _, sess := range m.sessions {
+		snapshot = append(snapshot, sess)
+	}
+	m.mu.RUnlock()
+
+	cleared := 0
+	for _, sess := range snapshot {
+		if sess == nil {
+			continue
+		}
+		sess.mu.Lock()
+		if sess.Blueprint != nil {
+			sess.Blueprint = nil
+			cleared++
+		}
+		sess.mu.Unlock()
+	}
+	logger.Info("session blueprint cache cleared", "sessions", len(snapshot), "cleared", cleared)
+	return cleared
+}
+
 func (s *Session) Close() {
 	s.closeWithLogging(true, "")
 }
@@ -1403,7 +1446,7 @@ func (m *Manager) cleanup() {
 		}
 		hasActivePlayback := session.ActivePlays > 0 || len(session.Clients) > 0
 		evictIdle := !hasActivePlayback && now.Sub(session.LastAccess) > m.ttl
-		evictPostPlayback := !hasActivePlayback && !session.PlaybackEndedAt.IsZero() && now.Sub(session.PlaybackEndedAt) > PostPlaybackEvictTTL
+		evictPostPlayback := !hasActivePlayback && !session.PlaybackEndedAt.IsZero() && now.Sub(session.PlaybackEndedAt) > m.postPlaybackEvictTTL
 		evictStuckPlayback := hasActivePlayback && !session.PlaybackStartedAt.IsZero() && now.Sub(session.PlaybackStartedAt) > m.maxPlaybackDuration
 		if evictIdle || evictPostPlayback || evictStuckPlayback {
 			delete(m.sessions, id)
@@ -1638,9 +1681,6 @@ func (m *Manager) SegmentFetcherForProviders(providerIDs []string) loader.Segmen
 	defer m.mu.RUnlock()
 	if m.usenetPool == nil {
 		return nil
-	}
-	if len(providerIDs) == 0 {
-		return m.usenetPool
 	}
 	subset := m.usenetPool.Subset(providerIDs)
 	if subset == nil {

@@ -52,8 +52,10 @@ func testNewznabUsageManager(t *testing.T) *indexer.UsageManager {
 
 func TestNewznabSearch(t *testing.T) {
 	logger.Init("DEBUG")
+	var gotUserAgent string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
 
 		if r.URL.Query().Get("apikey") != "test-api-key" {
 			w.WriteHeader(http.StatusForbidden)
@@ -87,9 +89,10 @@ func TestNewznabSearch(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(config.IndexerConfig{
-		Name:   "MockIndexer",
-		URL:    server.URL,
-		APIKey: "test-api-key",
+		Name:        "MockIndexer",
+		URL:         server.URL,
+		APIKey:      "test-api-key",
+		QueryHeader: "Prowlarr/2.3.0.5236",
 	}, nil)
 	req := indexer.SearchRequest{
 		Cat:    "2000",
@@ -117,6 +120,9 @@ func TestNewznabSearch(t *testing.T) {
 
 	if item.SourceIndexer == nil {
 		t.Error("SourceIndexer was not populated")
+	}
+	if gotUserAgent != "Prowlarr/2.3.0.5236" {
+		t.Fatalf("User-Agent = %q, want %q", gotUserAgent, "Prowlarr/2.3.0.5236")
 	}
 }
 
@@ -247,7 +253,9 @@ func TestNewznabSearchLimitKeepsExplicitValueEvenAboveCapsMax(t *testing.T) {
 
 func TestNewznabPing(t *testing.T) {
 	logger.Init("DEBUG")
+	var gotUserAgent string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
 		if r.URL.Query().Get("t") == "caps" {
 			w.WriteHeader(http.StatusOK)
 		} else {
@@ -257,13 +265,17 @@ func TestNewznabPing(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(config.IndexerConfig{
-		Name:   "MockIndexer",
-		URL:    server.URL,
-		APIKey: "test-api-key",
+		Name:        "MockIndexer",
+		URL:         server.URL,
+		APIKey:      "test-api-key",
+		QueryHeader: "Prowlarr/2.3.0.5236",
 	}, nil)
 	err := client.Ping()
 	if err != nil {
 		t.Errorf("Ping failed: %v", err)
+	}
+	if gotUserAgent != "Prowlarr/2.3.0.5236" {
+		t.Fatalf("User-Agent = %q, want %q", gotUserAgent, "Prowlarr/2.3.0.5236")
 	}
 }
 
@@ -341,19 +353,22 @@ func TestDownloadNZBUsesNormalizedURL(t *testing.T) {
 	logger.Init("DEBUG")
 	var gotAPIKey string
 	var gotID string
+	var gotUserAgent string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAPIKey = r.URL.Query().Get("apikey")
 		gotID = r.URL.Query().Get("id")
+		gotUserAgent = r.Header.Get("User-Agent")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "<nzb></nzb>")
 	}))
 	defer server.Close()
 
 	client := NewClient(config.IndexerConfig{
-		Name:   "MockIndexer",
-		URL:    server.URL,
-		APIKey: "test-api-key",
+		Name:       "MockIndexer",
+		URL:        server.URL,
+		APIKey:     "test-api-key",
+		GrabHeader: "SABnzbd/4.3.0",
 	}, nil)
 
 	data, err := client.DownloadNZB(context.Background(), server.URL+"/api?t=get&guid=guid-123")
@@ -368,6 +383,9 @@ func TestDownloadNZBUsesNormalizedURL(t *testing.T) {
 	}
 	if got := string(data); got != "<nzb></nzb>" {
 		t.Fatalf("DownloadNZB data = %q, want %q", got, "<nzb></nzb>")
+	}
+	if gotUserAgent != "SABnzbd/4.3.0" {
+		t.Fatalf("User-Agent = %q, want %q", gotUserAgent, "SABnzbd/4.3.0")
 	}
 }
 
@@ -917,6 +935,39 @@ func TestSearchTVIDModeOrdersQueryParams(t *testing.T) {
 	}
 
 	want := "apikey=test-api-key&t=tvsearch&cat=5000&tvdbid=462715&season=1&ep=1&offset=0&limit=2000&o=xml"
+	if gotRawQuery != want {
+		t.Fatalf("raw query = %q, want %q", gotRawQuery, want)
+	}
+}
+
+func TestSearchAggregatorIncludesCacheTimeParam(t *testing.T) {
+	var gotRawQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel></channel></rss>`)
+	}))
+	defer server.Close()
+
+	client := NewClient(config.IndexerConfig{
+		Name:                   "NZBHydra2",
+		Type:                   "aggregator",
+		URL:                    server.URL,
+		APIKey:                 "test-api-key",
+		SearchResultsCacheTime: 60,
+	}, nil)
+	client.caps = &indexer.Caps{Searching: indexer.CapsSearching{TVSearch: true}}
+
+	_, err := client.Search(indexer.SearchRequest{
+		Cat:        "5000",
+		Query:      "Interstellar",
+		SearchMode: "text",
+	})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+
+	want := "apikey=test-api-key&t=search&cat=5000&q=Interstellar&cachetime=60&offset=0&limit=2000&o=xml"
 	if gotRawQuery != want {
 		t.Fatalf("raw query = %q, want %q", gotRawQuery, want)
 	}
